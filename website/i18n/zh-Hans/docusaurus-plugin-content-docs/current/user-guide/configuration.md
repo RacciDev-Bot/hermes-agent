@@ -58,6 +58,65 @@ hermes config set OPENROUTER_API_KEY sk-or-...  # 保存到 .env
 机密（API 密钥、bot token、密码）放入 `.env`。其他所有内容（模型、终端后端、压缩设置、内存限制、工具集）放入 `config.yaml`。当两者都设置时，`config.yaml` 对非机密设置优先。
 :::
 
+## 运行时限制 {#runtime-limits}
+
+长时间运行的 Hermes 服务器面（包括 gateway 和
+`hermes serve --isolated`）在操作系统支持时，会在启动期间应用配置的
+`RLIMIT_NOFILE` 软限制：
+
+```yaml
+runtime:
+  nofile_soft_limit: 4096
+```
+
+默认值为 `4096`。Hermes 会把目标值钳制到操作系统的硬限制，并且绝不会降低一个
+已经拥有更高软限制的进程。将值设为 `0`、`false` 或 `null` 可禁用该调整。在 Windows 上以及
+无法修改该限制的沙箱中，启动会继续进行而不改动该限制。
+
+## 数据库设置 {#database-settings}
+
+`database:` 段控制 Hermes 如何打开它的 SQLite 状态数据库
+（`state.db`），该数据库存储会话、消息和 gateway 路由：
+
+```yaml
+database:
+  # state.db 的 journal 模式：wal（默认）或 delete。
+  # 在 WAL 不安全的文件系统（网络挂载）上使用 delete。在
+  # virtiofs/9p 绑定挂载（Docker Desktop、macOS 上的 Podman、OrbStack）上，
+  # Hermes 会检测该挂载并以 delete 模式新建数据库。
+  # 注意：已存在的磁盘 WAL 数据库永远不会被
+  # 在线降级 —— Hermes 会保持 WAL 并记录错误，告诉你配置的
+  # delete 未生效（或 WAL 数据库位于跨 VM 挂载上）。要转换
+  # 已有数据库，请停止所有使用它的进程并运行
+  # `hermes sessions set-journal-mode delete`（见 Sessions）。
+  journal_mode: wal
+
+  # 每个 state.db 连接的持久性级别：OFF、NORMAL、FULL、
+  # EXTRA（或 0-3）。不设置则沿用 SQLite 的编译期默认值，
+  # 不同解释器构建可能不同。在 macOS 上这是下限而非
+  # 固定值：低于 FULL 的值会被拒绝，以防 Darwin 的 fsync
+  # 重排序；EXTRA 会被接受。
+  # synchronous: FULL
+
+  # 可选的 WAL 尺寸 pragma（整数）。不设置 = SQLite 默认值。
+  # wal_autocheckpoint: 1000     # 自动检查点之间的页数
+  # journal_size_limit: 67108864 # WAL/journal 大小上限（字节）
+```
+
+当现有数据库的磁盘 journal 模式在打开时被静默切换为 WAL 时，Hermes 也会发出警告
+（每个进程每个数据库一次）——例如运维人员曾手动将其转换为 `delete` 的数据库——
+并指出 `database.journal_mode` 是让该选择固定下来的设置。
+反向操作永远不会自动发生：已经处于 WAL 模式的数据库在你设置
+`journal_mode: delete` 时不会被在线降级（在有打开连接的情况下降级
+可能损坏它）。`hermes doctor` 会警告
+`<db> is in WAL mode despite database.journal_mode=delete`，直到你停止
+该 profile 的所有 Hermes 进程并运行
+`hermes sessions set-journal-mode delete`（当仍有东西持有该文件时它会拒绝，
+并验证转换后的文件头）。在该警告下，它会列出当前持有数据库的
+进程（`<db> is held by PID <n> (<command>)`），
+让你知道该停止什么；当持有者扫描不完整或不可用时，它会说
+`cannot prove the database is quiet`，而不是给出"一切正常"的结论。
+
 ## 环境变量替换
 
 可以在 `config.yaml` 中使用 `${VAR_NAME}` 语法引用环境变量：
@@ -82,7 +141,58 @@ delegation:
 
 还可以设置 `providers.<id>.stale_timeout_seconds` 用于非流式陈旧调用检测器，以及 `providers.<id>.models.<model>.stale_timeout_seconds` 作为特定模型的覆盖值。此值优先于旧版 `HERMES_API_CALL_STALE_TIMEOUT` 环境变量。
 
-不设置这些值将保持旧版默认值（`HERMES_API_TIMEOUT=1800`s、`HERMES_API_CALL_STALE_TIMEOUT=90`s、原生 Anthropic 900s）。隐式的非流式 stale 检测会在本地端点上自动禁用，并且会在超大上下文下自动放宽。目前不适用于 AWS Bedrock（`bedrock_converse` 和 AnthropicBedrock SDK 路径均使用 boto3 及其自身的超时配置）。请参阅 [`cli-config.yaml.example`](https://github.com/NousResearch/hermes-agent/blob/main/cli-config.yaml.example) 中的注释示例。
+不设置这些值将保持旧版默认值（`HERMES_API_TIMEOUT=1800`s、`HERMES_API_CALL_STALE_TIMEOUT=90`s、原生 Anthropic 900s）。隐式的非流式 stale 检测会在本地端点上自动禁用，并且会在超大上下文下自动放宽。在 AWS Bedrock（`providers.bedrock`）上，解析后的请求超时是 boto3 Converse 客户端（`bedrock_converse`）与 AnthropicBedrock SDK 客户端的 socket 读取超时，按请求为当前模型选定，因此 `/model` 切换或回退会使用该模型的值。连接超时保持固定（botocore 在 Converse 上为 60s，在 AnthropicBedrock 上为 10s），读取超时约束的是每次 socket 读取，而非整个调用。不设置则保持 botocore 在 Converse 上的 60s 读取超时和 AnthropicBedrock 上的 900s。请参阅 [`cli-config.yaml.example`](https://github.com/NousResearch/hermes-agent/blob/main/cli-config.yaml.example) 中的注释示例。
+
+## 更新行为 {#update-behavior}
+
+### 后台检查 {#background-checks}
+
+被动更新检查（CLI 横幅、TUI 徽章、dashboard、桌面应用）会向
+GitHub REST API 询问 `main` 的末端提交，当它与你的检出不同时，再询问
+compare 端点以获取精确的提交数和变更日志。它们从不运行
+`git fetch` ——在部分克隆（`--filter=blob:none`）中，它们也不会
+从 promisor 远程下载缺失的对象（Git 2.44 或更新版本）——并且
+每次安装最多**每 24 小时查询一次**（检查失败会在 1 小时后
+重试）。应用更新（`hermes update`，或桌面端的
+Update 按钮）总是重新抓取并使缓存的答案失效。显式
+检查 —— `hermes update --check`、桌面端的 "Check for Updates…" 菜单项、
+Settings → About → "Check now" —— 会绕过缓存。
+
+### SSH 认证 {#ssh-authentication}
+
+启动时的更新检查使用与其网络调用相同的隔离 Git
+配置来读取 origin URL。因此全局的 `url.*.insteadOf` 重写
+无法向公共 HTTPS 路径隐藏一个官方 SSH 远程。
+
+Hermes 的隔离内部 Git 命令默认使用 `ssh -o BatchMode=yes`：
+未知的主机密钥、密码，以及需要口令的加密密钥会失败
+而不是打开终端提示。拥有可用密钥或
+SSH agent 的可信主机仍可完成认证。这不会改变你磁盘上的 Git 或 SSH
+配置，也不会改变你在终端工具中运行的命令。
+
+该内部默认值会覆盖仓库的 `core.sshCommand` 设置。显式的
+`GIT_SSH_COMMAND` 环境变量仍然优先，因此
+自定义身份或传输命令可以保留在那里。如果这类覆盖必须保持非交互，
+请在其中包含 `-o BatchMode=yes`；
+允许提示的覆盖仍可能打断后台检查。
+
+`hermes update` 的设置位于 `config.yaml` 的 `updates` 下：
+
+```yaml
+updates:
+  pre_update_backup: quick       # quick（状态快照，默认） | full（快照 + HERMES_HOME zip） | off
+  backup_keep: 5                 # 保留多少个完整的更新前备份 zip
+  non_interactive_local_changes: stash  # stash | discard
+  auto_switch_parked_branch: true       # 自动将一个干净且已完全合并的 parked 分支切回 main
+```
+
+`pre_update_backup` 是唯一的更新前安全开关：`quick`（默认）将关键状态文件（配对数据、cron 任务、配置、认证；超过 1 GiB 的文件会跳过）快照到 `state-snapshots/`；`full` 还会把整个 `HERMES_HOME` 打包到 `backups/`，在大型 home 上可能多花几分钟；`off` 两者都禁用。旧版布尔值仍被接受（`true` → `full`，`false` → `off`）。
+
+`config.yaml` 自身的时点副本（在 `hermes setup` 重写它之前、在 `hermes migrate` 编辑它之前、每次文件解析成功时，以及解析失败时）会放入 `backups/config/config.yaml.<reason>.<timestamp>`。相同的重复副本会被跳过，每个原因只保留最新的五份，因此它们不会在 `config.yaml` 旁边堆积。如果 `config.yaml` 已损坏，Hermes 会提供最新的 `good` 副本而不是内置默认值，并在每次启动时警告，直到 YAML 被修好；损坏的文件永远不会被修改。
+
+对于 git 安装，Hermes 在检出更新分支或拉取之前，会自动 stash 已跟踪的脏文件和未跟踪文件。交互式终端更新会在恢复该 stash 前提示。非交互式更新（桌面/聊天应用、gateway 或 `--yes`）使用 `updates.non_interactive_local_changes`：`stash` 在成功拉取后恢复本地源码改动，而 `discard` 在成功拉取后丢弃更新产生的 stash。仅在本地源码改动从不需要持久化的托管安装上使用 `discard`。
+
+在 stash 步骤之前，Hermes 还会恢复由 npm 安装/构建产生的已跟踪 `package-lock.json` 差异。更新前请提交或手动 stash 有意的 lockfile 修改。
 
 ## 终端后端配置
 
