@@ -1756,3 +1756,24 @@ Hermes 使用两种不同的上下文范围：
 MESSAGING_CWD=/home/myuser/projects    # Gateway 会话
 TERMINAL_CWD=/workspace                # 所有终端会话
 ```
+
+## Webapp
+
+gateway 可以在自己的监听器上提供[浏览器中的 Desktop 工作区](./desktop.md#use-the-desktop-workspace-from-a-browser)。在你启用它之前，它是关闭的。
+
+```yaml
+webapp:
+  enabled: false     # true：gateway 提供 Webapp
+  host: 127.0.0.1    # 127.0.0.1、::1 或 localhost；或 0.0.0.0 / :: 供其他机器访问（需要仪表盘登录）
+  port: 9120         # 固定端口，这样 gateway 重启后浏览器的地址保持不变
+  public_url: ""     # 反向代理或隧道提供 Webapp 所用的 https:// 地址（需要登录）
+```
+
+- `enabled` — gateway 在启动时读取它；修改后需重启 gateway（`hermes gateway restart`）。
+- `host` — `127.0.0.1`、`::1` 或 `localhost` 让 Webapp 只留在本机。`0.0.0.0` 或 `::` 使其可从其他机器访问，并要求配置一个[仪表盘登录提供商](./features/web-dashboard.md#authentication-gated-mode)；没有提供商时，gateway 只提供原生客户端服务，`hermes webapp --status` 会说明原因。添加提供商后请重启 gateway。其他任何值（包括 `127.0.0.2` 这类另一个回环地址）都会让 Webapp 保持关闭。
+- `port` — 独立 profile 的 gateway 需要使用与默认 gateway 不同的端口。**Settings → Web Access → Start** 会为未设置端口的独立 profile 选择一个端口（9120 以上、其他 profile 未占用的第一个空闲端口）并保存到此处；它绝不会替换你设置的端口。端口被占用时，gateway 同样只提供原生客户端服务，`hermes webapp --status` 会报告原因。这也会替换 Webapp 的浏览器登录，因为该端口可能已被其他程序收到，所以端口释放后已打开的标签页需要重新执行 `hermes webapp`。
+- `public_url` — 当你运行的反向代理或隧道以自身地址（转发到 `host:port`）提供 Webapp 时设置它。它即使在回环 `host` 上也会开启仪表盘登录，是 Webapp 接受请求的唯一外部主机名，登录回调也基于它构建。没有登录提供商时，与 `0.0.0.0` 的情况一样，gateway 只提供原生客户端服务。它必须是 `http://` 或 `https://` 地址，且不带凭据、查询串或片段；其他任何值都会让 Webapp 保持关闭。`dashboard.public_url` 用于 `hermes dashboard`，永远不会作用于 Webapp。
+
+无论 `host` 是什么，只要 `host` 为 `0.0.0.0` 或 `::`，或设置了 `public_url`，就会启用登录。此时 `hermes webapp` 会打开 Webapp 的地址（设置了 `public_url` 时就是登录返回的地址）供你用仪表盘账户登录：它的一次性链接只会打开无需登录的 Webapp。原生客户端（CLI、TUI 和 Desktop 应用）从不登录：gateway 为它们提供的监听器永远不会要求登录，无论配置如何。
+
+Webapp 设置从为该 profile 提供服务的 gateway 的配置中读取：对于它服务的具名 profile，读取默认 profile 的配置；否则读取独立 profile 自己的配置。
