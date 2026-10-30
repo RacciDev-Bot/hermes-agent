@@ -39,6 +39,52 @@ hermes dashboard --host 0.0.0.0
 hermes dashboard --no-open
 ```
 
+## 管理多个 profile
+
+Dashboard 是一个**机器级**管理界面：一台服务器管理该机器上的每个
+[profile](../profiles.md)。侧边栏中的 profile 切换器（只要存在不止一个 profile 就会显示）
+决定管理页面读写的 profile —— Config、API Keys、Skills、
+MCP、Models 和 Chat 标签页都跟随它。当选中的不是 dashboard 自己的
+profile 时，一条琥珀色横幅会标明被管理的 profile，
+这样写入目标永远不会含糊。
+
+选择保存在 URL 中（`?profile=<name>`），因此像
+`http://127.0.0.1:9119/skills?profile=worker` 这样的深链会带着预选的
+切换器打开，并在刷新后保持。
+
+从 profile 别名启动 dashboard 会路由到机器级
+dashboard，而不是再启动第二个服务器：
+
+```bash
+worker dashboard
+# → 已在运行：在浏览器中打开 ?profile=worker
+# → 未运行：启动机器级 dashboard，并预选 "worker"
+```
+
+这样启动的 dashboard 会在整个服务器生命周期内把 `worker` 作为回退作用域：
+省略 `?profile=` 的深链（例如
+`/chat?resume=<id>` 链接）仍会在 `worker` 下打开，因此内嵌聊天
+能看到该 profile 的 MCP 服务器、模型和技能。URL 中显式的 `?profile=`
+始终优先。
+
+传入 `--isolated` 可退出该行为，运行一个专属于该
+profile 的服务器（统一之前的行为 —— 如果你有意用不同的认证
+暴露不同 profile 的 dashboard，这会很有用）。
+
+**Chat** 标签页也跟随切换器：限定作用域的聊天会用所选 profile 的
+`HERMES_HOME` 派生出它的 PTY 子进程，因此对话会带着该 profile 的模型、
+技能、内存和会话历史运行。切换 profile 会启动一个新的终端会话。
+
+Hub 操作（技能安装/更新/卸载、MCP 安装、工具集设置）
+使用目标 profile 自己的机密作用域运行 —— 它的 `.env` 和配置的
+机密来源 —— 而不是 dashboard 进程的环境；这也包括从机器级 dashboard
+针对 `default` profile 的操作。
+
+保持不变、*不会*被切换器吸收的：gateway
+进程（通过 `hermes -p <name> gateway …` 管理）、每个 profile 的
+会话数据库，以及 cron 调度器（Cron 页面已用自带的过滤器
+跨 profile 聚合）。
+
 ## 前置条件
 
 FastAPI、Uvicorn 和平台 PTY 辅助库是 Hermes 核心依赖。`web` extra 提供 HTTP 栈的精确约束，`pty` extra 为空。
@@ -83,6 +129,65 @@ Chat 标签页是每次 `hermes dashboard` 启动的一部分——内嵌的浏�
 - POSIX 内核（Linux、macOS 或 WSL2）。`/chat` 终端面板特别需要 POSIX PTY——原生 Windows Python 没有等效实现，因此在原生 Windows 安装上，Dashboard 的其余部分（sessions、jobs、metrics、config editor）可以正常工作，但 `/chat` 标签页会显示提示，告知你需要使用 WSL2 才能使用该功能。
 
 关闭浏览器标签页后，PTY 会在服务器端被干净地回收。重新打开会启动一个新会话。
+
+要让 [Hermes Desktop](#connecting-hermes-desktop-to-a-remote-backend) 连接另一台机器上运行的 dashboard 而不是它自带的本地后端，请参阅下面的远程后端部分。
+
+### 将 Hermes Desktop 连接到远程后端 {#connecting-hermes-desktop-to-a-remote-backend-pages}
+
+Hermes Desktop 通常启动自己的本地后端，但它也可以通过 **Settings → Gateways → Remote gateway** 连接到远程机器（VM、homelab 机器等）上运行的 dashboard。这是 "Desktop 说后端已就绪但聊天永远不工作" 这类报告最常见的来源，因为 Desktop 的就绪检查验证的内容比实时聊天连接实际需要的少。
+
+:::info 前提：远程主机上必须有 `hermes dashboard` 在运行
+Desktop 连接的"远程后端"**就是**远程机器上运行的 `hermes dashboard` 进程 —— 也就是本页记录的这个服务器。它必须在下面任何步骤生效之前就启动并可访问；Desktop 是连接到它，而不是替你启动它。请让它运行在 `systemd`/`tmux`/等之下，以熬过注销和重启。**gateway**（Telegram/Discord/Slack/等）是一个*独立*的长期运行进程 —— 如果你依赖消息渠道，请单独启动它；它不是桌面应用连接的东西。
+:::
+
+Desktop 的"远程后端已就绪"探针只访问 `GET /api/status`，这是一个公开端点 —— 只要主机上*任何* dashboard 在运行，它就会应答。实时聊天连接是到一个**独立**的 WebSocket `/api/ws`（以及 `/api/pty`），该 socket 还受状态探针从不触及的两项检查把关：
+
+1. **你必须通过认证。** 当 dashboard 绑定到非回环地址时，它会启用认证门禁。请用用户名和密码保护它（随附的[用户名/密码提供商](#usernamepassword-provider-no-oauth-idp)）；Desktop 登录一次，并通过一次性票据为 WebSocket 复用产生的会话。未配置提供商时，非回环 dashboard 会在启动时**失败即关闭**。
+2. **绑定主机必须允许该客户端，并与 Host 头匹配。** 回环绑定（`127.0.0.1`）只接受回环客户端，因此无论凭据如何，远程机器都会在 socket 层被拒绝。请绑定到非回环地址（`--host 0.0.0.0`），让对端 IP 守卫放行远程客户端。你在 Desktop 中输入的远程 URL 必须通过与其绑定相同的主机到达 dashboard —— DNS 重绑定守卫要求 Host 头匹配。
+
+#### 远程 dashboard 配置 {#remote-dashboard-setup}
+
+设置用户名和密码，然后把 dashboard 绑定到可达地址运行。以 `systemd` 服务为例：
+
+```ini
+[Service]
+EnvironmentFile=%h/.hermes/.env
+ExecStart=/path/to/venv/bin/python -m hermes_cli.main dashboard \
+    --host 0.0.0.0 --port 9119 --no-open
+Restart=always
+RestartSec=10
+# 退出码 78（EX_CONFIG）是有意的拒绝（"this host is already served by PID … on
+# another port"）；停在该状态好过让一个什么都没监听的进程无限重启。
+RestartPreventExitStatus=78
+```
+
+一个后端服务整台主机，因此当 `hermes dashboard` 发现一个无法用你输入的 `--host`/`--port` 服务的在线后端时，它会以退出码 78 拒绝并指出持有者。请停止那个后端，或用 `--isolated` 给该服务一个专属服务器。Desktop 应用自己的回环后端从不主张主机所有权，因此两者可以共存，无需任何标志。
+
+其中 `~/.hermes/.env` 包含：
+
+```bash
+HERMES_DASHBOARD_BASIC_AUTH_USERNAME=admin
+HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=choose-a-strong-password
+HERMES_DASHBOARD_BASIC_AUTH_SECRET=<32+ random bytes; openssl rand -base64 32>
+```
+
+然后在 Desktop 中输入**远程 URL**（例如 `http://VM_IP:9119`）并用该用户名和密码**登录**。完整配置面见[用户名/密码提供商](#usernamepassword-provider-no-oauth-idp)部分。
+
+:::tip 重试 Desktop 之前先确认门禁已启用
+从任意机器检查 dashboard 是否宣告了用户名/密码提供商：
+
+```bash
+curl -s http://VM_IP:9119/api/status | jq '.auth_required, .auth_providers'
+# true
+# ["basic"]
+```
+
+- `auth_required: true` 且提供商列表中有 `"basic"` → Desktop 的**登录**流程会成功。
+- `auth_required: false` → 绑定是回环，或门禁未启用。请绑定到非回环地址。
+- `auth_required: true` 但没有 `"basic"` 提供商 → 用户名/密码环境变量未加载。请先修好这些。
+:::
+
+如果 `/api/status` 显示门禁已启用且提供商为 `"basic"`，而 Desktop 登录后*仍然*连接失败，那么问题已超出基础配置 —— 请在同一重试时间窗内抓取一份新的 `desktop.log`（Settings → Gateways → Open logs）以及 dashboard 的日志，并查找 `/api/ws` 的关闭码（4403 = 聊天 WS 被请求守卫拒绝，例如 Host/对端不匹配；4401 = WS 票据未通过认证）。
 
 ### Config（配置）
 
@@ -167,18 +272,115 @@ Chat 标签页是每次 `hermes dashboard` 启动的一部分——内嵌的浏�
 - **Trigger now** — 在正常计划之外立即执行任务
 - **Delete** — 永久删除定时任务
 
+### Profiles（Profile）
+
+创建和管理 [profile](../profiles.md) —— 拥有各自配置、技能和会话的隔离 Hermes 实例。
+
+- **Profile 卡片** —— 每个显示其模型/提供商、技能数、gateway 状态、描述和徽章（活跃、默认、别名）
+- **Create** —— 名称 + 可选的自默认克隆 / 克隆全部 / 不含内置技能，以及描述和模型；专用的 Profile Builder 页面（`/profiles/new`）提供完整流程（模型、MCP、技能）
+- **管理技能与工具** —— 跳转到限定到该 profile 的 Skills 页面（同时设置侧边栏的 profile 切换器）
+- **Set as active** —— 翻转粘性默认值，**将来的 CLI/gateway 运行**会采用它（等同于 `hermes profile use`）。这*不*改变 dashboard 管理的是哪个 profile —— 那是 profile 切换器的职责
+- **编辑模型 / 描述 / SOUL** —— 就地编辑并写入该 profile
+- **Rename / Delete** —— 仅限具名 profile
+
 ### Skills（技能）
 
-浏览、搜索和切换技能与工具集。技能从 `~/.hermes/skills/` 加载，并按类别分组。
+浏览、搜索和切换已安装的技能与工具集，并从 hub 安装新的。技能从 `~/.hermes/skills/` 加载，并按类别分组。
 
-- **Search** — 按名称、描述或类别过滤技能和工具集
-- **Category filter** — 点击类别标签缩小列表范围（如 MLOps、MCP、Red Teaming、AI）
-- **Toggle** — 使用开关启用或禁用单个技能。更改在下一次会话时生效。
-- **Toolsets** — 单独的部分显示内置工具集（文件操作、Web 浏览等），包含其活跃/非活跃状态、设置要求和包含的工具列表
+- **Search** —— 按名称、描述或类别过滤已安装的技能和工具集
+- **Category filter** —— 点击类别标签缩小列表范围（如 MLOps、MCP、Red Teaming、AI）
+- **Toggle** —— 使用开关启用或禁用单个技能。更改在下一次会话时生效。
+- **Toolsets** —— 单独的视图显示内置工具集（文件操作、Web 浏览等），包含其活跃/非活跃状态、设置要求和包含的工具列表
+- **Browse hub** —— 第三个视图跨所有来源搜索技能 hub（等同于 `hermes skills search`），按标识符安装任意结果并显示实时安装日志，还提供 "Update all" 按钮刷新已安装的技能。
 
-:::warning 安全提示
-Web Dashboard 会读写包含 API 密钥和机密的 `.env` 文件。它默认绑定到 `127.0.0.1`——只能从本机访问。如果绑定到 `0.0.0.0`，网络上的任何人都可以查看和修改你的凭据。Dashboard 本身没有任何认证机制。
+![技能管理页 —— Browse hub 视图：搜索、安装和更新](/img/dashboard/admin-skills-hub.png)
+
+### MCP
+
+无需 CLI 即可管理 [MCP](./mcp) 服务器。与 `hermes mcp` 读取的是 `config.yaml` 中同一个 `mcp_servers` 块。
+
+**你的 MCP 服务器：**
+
+- **Add** —— 注册 HTTP/SSE 服务器（URL）或 stdio 服务器（命令 + 参数），stdio 服务器可带 `KEY=VALUE` 环境变量
+- **Enable / disable** —— 启用或停用服务器而不删除它。停用的服务器保留在配置中，以便之后重新启用。在下一次 gateway 重启时生效。
+- **Test** —— 连接服务器、列出其工具并断开 —— 在 agent 依赖它之前验证连接
+- **Remove** —— 从配置中删除服务器
+- 机密形态的环境变量值在列表视图中会被打码
+
+**目录：** 浏览 Nous 批准的 MCP 服务器（随附的 `optional-mcps/`
+目录），一键安装任意一个。需要 API 密钥的条目
+会就地提示输入；值会写入 `.env`。这与
+`hermes mcp catalog` / `hermes mcp install` 使用的是同一个目录。
+
+![MCP 管理页 —— 带启用/停用开关的服务器列表，以及安装目录](/img/dashboard/admin-mcp.png)
+
+### Webhooks
+
+管理动态 [webhook 订阅](../messaging/webhooks.md)。必须先在消息设置中
+启用 webhook 平台；未启用时该页面会显示提示。
+
+- **Create** —— 名称、描述、事件过滤器、投递目标、可选的直投模式，以及 agent prompt。创建后页面会显示路由 URL 和一次性 HMAC 机密供复制。
+- **Enable / disable** —— 启用或停用订阅。停用的路由保留在订阅文件中，但 gateway 会拒绝它们传入的事件（403）。gateway 会热重载该文件，因此更改在下一个事件时生效 —— 无需重启。
+- **List** —— 每个订阅显示其 URL、事件和投递目标
+- **Delete** —— 删除订阅
+
+![Webhooks 管理页 —— 带启用/停用开关的订阅](/img/dashboard/admin-webhooks.png)
+
+### Pairing
+
+无需 CLI 即可批准和撤销消息用户 —— 远程管理员
+可以用它把 Telegram/Discord/等用户接入已配对的 gateway。与
+`hermes pairing` 完全对等。
+
+- **待处理请求** —— 每个显示平台、代码、用户和时长，并带 Approve 按钮
+- **已批准用户** —— 每个显示平台和用户，并带 Revoke 按钮
+- **Clear pending** —— 丢弃所有未完成的配对码
+
+![Pairing 管理页](/img/dashboard/admin-pairing.png)
+
+### Channels
+
+从浏览器把 Hermes 连接到任意消息平台 —— 与
+`hermes setup gateway` 完全对等。该页面列出所有支持的渠道（Telegram、
+Discord、Slack、Matrix、Mattermost、WhatsApp、Signal、BlueBubbles/iMessage、
+Email、SMS/Twilio、DingTalk、Feishu/Lark、WeCom、WeChat、QQ Bot、Yuanbao，以及
+API server 和 webhook 端点）及其实时连接状态。
+
+- **Configure** —— 打开按平台定制的表单，只包含该渠道需要的字段（bot token、app token、服务器 URL、允许列表等）。机密渲染为密码输入框并以打码形式保存；留空字段会保留现有值。必填字段会被标记并校验。"Setup guide" 链接指向该平台的凭据文档。
+- **Enable / disable** —— 启用或停用渠道。凭据仍保留在磁盘上，只是活跃状态改变。
+- **Test** —— 检查该渠道是否已配置、已启用，并报告来自 gateway 的实时连接。
+- **Restart gateway** —— 凭据写入 `~/.hermes/.env`，启用标志写入 `config.yaml`；gateway 会在下一次重启时连接每个已启用的渠道，你可以直接从页面触发该重启。在系统级安装（`hermes gateway install --system`）上，dashboard 以 `sudo -n` 执行重启，因此 dashboard 用户需要免密 sudo；没有它，请求会立即失败，而不是报告一个随后被 CLI 拒绝的重启。
+
+![Channels 管理页 —— 每个消息平台的状态、启用开关和按平台配置表单](/img/dashboard/admin-channels.png)
+
+### System
+
+面向整机安装操作的统一管理面板：
+
+- **Host** —— 实时系统统计：OS / 内核、架构、主机名、Python 与 Hermes 版本、CPU 核心数 + 利用率、内存、Hermes home 的磁盘占用、运行时长和平均负载。（安装 `psutil` 时 CPU/内存/磁盘来自它；身份字段始终显示。）Hermes 版本会显示**更新状态徽章**（已是最新 / 落后 N 个提交）和一个 **Check for updates** 按钮。git 安装有可用更新时，**Update now** 按钮会先打开确认对话框 —— 显示你将拉取多少提交 —— 然后在后台运行 `hermes update`。在 Docker/Nix 安装上，dashboard 无法就地应用更新，因此会改为显示正确的带外命令。
+- **Nous Portal** —— 登录状态、当前推理提供商，以及 Tool Gateway 路由表（哪些工具经由 Portal、哪些本地运行），并附管理订阅的链接。`hermes portal` 的只读镜像。
+- **Skill curator** —— 后台技能维护状态（活跃 / 已暂停、间隔、上次运行），带暂停/恢复和立即运行按钮。镜像 `hermes curator`。
+- **Gateway** —— 启动、停止和重启消息 gateway，并显示实时状态（运行中/已停止、PID、状态）
+- **Memory** —— 选择外部内存提供商（或仅内置），并重置内置的 `MEMORY.md` / `USER.md` 存储
+- **Credential pool** —— 添加和移除 agent 轮换使用的 API 密钥（按提供商）。密钥在列表中被 打码；原始值只会到达 agent。
+- **Operations** —— 运行 `doctor`、安全审计、创建备份、从备份归档恢复、更新技能、显示系统提示体积明细、生成支持转储，或为退役设置迁移配置。每项都会派发一个后台操作，其实时日志会流式显示在页面中。
+- **Checkpoints** —— 查看 `/rollback` 影子存储的大小并修剪它
+- **Shell hooks** —— 列出已配置的钩子及其同意状态 + 可执行状态，**创建**钩子（事件、命令、匹配器、超时，并附主动授予的同意），以及移除钩子。钩子会运行任意命令，因此创建表单带有安全警告，且钩子只有在授予同意后才会触发。
+
+![System 管理页 —— 主机统计与 Nous Portal 状态](/img/dashboard/admin-system-top.png)
+
+![System 管理页 —— 技能维护、gateway、内存和凭据池](/img/dashboard/admin-system-curator.png)
+
+![System 管理页 —— 操作、检查点和 shell 钩子](/img/dashboard/admin-system-ops.png)
+
+创建 shell 钩子（注意同意复选框和运行任意命令的警告）：
+
+![新建 shell 钩子对话框](/img/dashboard/admin-hook-create.png)
+
+:::warning 安全
+Web Dashboard 会读写包含 API 密钥和机密的 `.env` 文件。它默认绑定到 `127.0.0.1` —— 只能从本机访问，无需登录。绑定到任何非回环地址（包括 `0.0.0.0`）都会启用[认证门禁](#authentication-gated-mode)：在配置认证提供商（用户名/密码或 OAuth）之前，服务器会拒绝启动。
 :::
+
 
 ## `/reload` 斜杠命令
 
@@ -198,6 +400,10 @@ Web Dashboard 暴露了一个供前端使用的 REST API。你也可以直接调
 ### GET /api/status
 
 返回 agent 版本、gateway 状态、平台状态和活跃会话数。
+
+### GET /api/chat/workspaces
+
+新的 Chat 标签页会话可以作为起始目录的目录列表：该 profile 的项目（含文件夹）以及发现的 git 仓库（`root`、`label`、`sessions`、`last_active`），外加 `default_cwd`（未选择任何项时聊天落在哪里）和 `home`。`?scan=1` 会先在主机上重新扫描 `desktop.repo_scan_roots`。与 `/api/pty?cwd=<path>` 配合使用，后者在目录缺失时失败即关闭。
 
 ### GET /api/sessions
 
@@ -247,6 +453,19 @@ Web Dashboard 暴露了一个供前端使用的 REST API。你也可以直接调
 
 删除会话及其消息历史。
 
+### 当 gateway 拥有存储时进行批量维护
+
+`POST /api/sessions/bulk-delete`、`DELETE /api/sessions/empty`、`POST /api/sessions/prune`
+（非 dry-run）和 `POST /api/sessions/owner-backfill` 会一次重写许多行，
+并绕过按会话的修订围栏，因此它们是**离线维护**：会获取该 profile 的
+排他 `gateway.lock`。当该 profile 的 gateway 正在运行时，它们会返回
+`409` 并说明 `Exclusive maintenance refused: Gateway runtime already owns profile <home>.
+Drain and stop the gateway, then retry.`，且不做任何更改。请停止 gateway
+（`hermes gateway stop`），运行维护调用，然后再启动它。`dry_run` 的 prune
+和所有读取端点可对运行中的 gateway 继续工作。Desktop 的一次性旧版
+owner 回填会把该 `409` 视为已连接 gateway 的稳态（就像没有该路由的后端），
+并且不会在每次侧边栏刷新时重试。
+
 ### GET /api/logs
 
 返回日志行。查询参数：`file`（agent/errors/gateway）、`lines`（数量）、`level`、`component`。
@@ -290,6 +509,54 @@ Web Dashboard 暴露了一个供前端使用的 REST API。你也可以直接调
 ### GET /api/tools/toolsets
 
 返回所有工具集，包含其标签、描述、工具列表以及活跃/已配置状态。
+
+### 管理端点 {#admin-endpoints}
+
+这些端点驱动 MCP、Channels、Webhooks、Pairing 和 System 页面。它们都与 `/api/` 的其余部分处于同一认证门禁之后。
+
+| 方法与路径 | 用途 |
+|---------------|---------|
+| `GET /api/mcp/servers` | 列出已配置的 MCP 服务器（环境变量值打码） |
+| `POST /api/mcp/servers` | 添加服务器。Body：`{name, url?, command?, args?, env?, auth?}` |
+| `POST /api/mcp/servers/{name}/test` | 连接、列出工具、断开 |
+| `PUT /api/mcp/servers/{name}/enabled` | 启用 / 停用服务器 |
+| `DELETE /api/mcp/servers/{name}` | 移除服务器 |
+| `GET /api/mcp/catalog` | 浏览 Nous 批准的 MCP 目录 |
+| `POST /api/mcp/catalog/install` | 安装目录条目（包含所需 env） |
+| `GET /api/messaging/platforms` | 列出所有消息渠道及其状态 + 按平台设置字段 |
+| `PUT /api/messaging/platforms/{id}` | 配置渠道。Body：`{enabled?, env?, clear_env?}`（env 写入 `.env`，enabled 写入 `config.yaml`） |
+| `POST /api/messaging/platforms/{id}/test` | 报告渠道是否已配置、已启用并已连接 |
+| `GET /api/pairing` | 列出待处理 + 已批准的消息用户 |
+| `POST /api/pairing/approve` | 批准配对码。Body：`{platform, code}` |
+| `POST /api/pairing/revoke` | 撤销用户。Body：`{platform, user_id}` |
+| `POST /api/pairing/clear-pending` | 丢弃所有待处理配对码 |
+| `GET /api/webhooks` | 列出订阅 + 平台启用状态 |
+| `POST /api/webhooks` | 创建订阅（返回一次性机密） |
+| `DELETE /api/webhooks/{name}` | 移除订阅 |
+| `GET /api/credentials/pool` | 列出轮换池中的密钥（打码） |
+| `POST /api/credentials/pool` | 添加密钥。Body：`{provider, api_key, label?}` |
+| `DELETE /api/credentials/pool/{provider}/{index}` | 移除密钥（从 1 开始的索引） |
+| `GET /api/memory` | 活跃提供商 + 可用提供商 + 内置文件大小 |
+| `PUT /api/memory/provider` | 选择提供商（空 = 仅内置） |
+| `POST /api/memory/reset` | 重置内置内存。Body：`{target: all\|memory\|user}` |
+| `POST /api/gateway/start` · `/stop` · `/restart` | gateway 生命周期（后台执行） |
+| `POST /api/ops/doctor` · `/security-audit` · `/backup` · `/import` | 诊断与维护（后台执行；通过 `/api/actions/{name}/status` 跟踪） |
+| `GET /api/ops/hooks` | 已配置的 shell 钩子 + 允许列表状态 |
+| `GET /api/ops/checkpoints` · `POST .../prune` | 查看 / 修剪 `/rollback` 存储 |
+| `POST /api/ops/hooks` · `DELETE /api/ops/hooks` | 创建 / 移除 shell 钩子（需授予同意） |
+| `GET /api/system/stats` | 主机统计 —— OS、CPU、内存、磁盘、运行时长 |
+| `GET /api/hermes/update/check` | 报告更新可用性（落后提交数、安装方式）但不应用。对落后的 git 安装，还会返回变更的 `commits` 列表（`sha`、`summary`、`author`、`at`）。`?force=1` 会绕过 24 小时缓存（检查走 GitHub API，从不 `git fetch`） |
+| `GET /api/curator` · `PUT .../paused` · `POST .../run` | 技能维护状态 + 暂停/恢复 + 运行 |
+| `GET /api/portal` | Nous Portal 认证 + Tool Gateway 路由（只读） |
+| `POST /api/ops/prompt-size` · `/dump` · `/config-migrate` | 诊断（后台执行） |
+| `PUT /api/webhooks/{name}/enabled` | 启用 / 停用 webhook 路由 |
+| `POST /api/skills/hub/install` · `/uninstall` · `/update` | 技能 hub 操作（后台执行） |
+| `GET /api/skills/hub/search` | 跨所有来源搜索技能 hub |
+| `GET /api/sessions/stats` | 会话存储统计 |
+| `PATCH /api/sessions/{id}` | 重命名 / 归档会话 |
+| `GET /api/sessions/{id}/export` | 将会话（元数据 + 消息）导出为 JSON |
+| `POST /api/sessions/prune` | 删除早于 N 天的已结束会话 |
+| `PUT /api/cron/jobs/{id}` | 编辑 cron 任务的 prompt / 计划 / 名称 / 投递 |
 
 ## 身份验证（门控模式） {#authentication-gated-mode}
 
