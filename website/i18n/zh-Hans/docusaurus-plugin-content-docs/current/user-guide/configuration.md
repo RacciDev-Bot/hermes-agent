@@ -31,18 +31,22 @@ description: "配置 Hermes Agent — config.yaml、providers、模型、API 密
 ```bash
 hermes config              # 查看当前配置
 hermes config edit         # 在编辑器中打开 config.yaml
+hermes config get KEY      # 打印解析后的值
 hermes config set KEY VAL  # 设置特定值
-hermes config check        # 检查缺失选项（更新后使用）
+hermes config unset KEY    # 移除用户设置的值
+hermes config check        # 检查缺失选项和过时的已保存选择
 hermes config migrate      # 交互式添加缺失选项
 
 # 示例：
+hermes config get model
 hermes config set model anthropic/claude-opus-4
 hermes config set terminal.backend docker
+hermes config unset terminal.backend
 hermes config set OPENROUTER_API_KEY sk-or-...  # 保存到 .env
 ```
 
 :::tip
-`hermes config set` 命令会自动将值路由到正确的文件 —— API 密钥保存到 `.env`，其他所有内容保存到 `config.yaml`。
+`hermes config set` 命令会自动将值路由到正确的文件 —— 每个 `UPPER_SNAKE` 形式的名称（`OPENROUTER_API_KEY`、`DISCORD_HOME_CHANNEL`、`TELEGRAM_GROUP_ALLOWED_USERS`、`HERMES_TIMEZONE` 等）都是环境变量，会保存到 `.env`，绝不会写入 `config.yaml`；带点的设置则进入 `config.yaml`。其他任何 `UPPER_SNAKE` 名称都会原样保存到 `.env`（并导出到进程环境供插件和技能使用）；位于环境变量写入器禁止列表上的名称（`HERMES_YOLO_MODE`、`PATH` 等）会被拒绝。已知键写在错误前缀下（`gateway.discord.foo`，而 `discord.foo` 本身是已知键）会在写入任何内容之前被拒绝并给出"你是不是想写"提示；加 `--force` 可以照样写入。已知段下的其他未知路径（例如 `agent.max_turnz` 这类拼写错误，或没有预置默认值的运行时读取键）会在写入的同时给出提示，因为仅凭 schema 无法区分两者。对这类路径执行 `hermes config get` 会打印你文件中的值，并在 stderr 提示 Hermes 可能不会读取它，因此遗留键无法悄悄冒充生效中的设置。
 :::
 
 ## 配置优先级
@@ -501,6 +505,24 @@ terminal:
 
 保持 `false`（默认）以获得向后兼容的行为。当您的工作流主要是"编辑挂载的宿主文件"且厌倦了 `sudo chown -R` 时，请开启此选项。
 
+### Snap 打包的 Docker（AppArmor） {#snap-packaged-docker-apparmor}
+
+在 Docker 以 snap 方式安装的主机上（Ubuntu 云镜像很常见，例如 Azure VM），snap 的 AppArmor 约束会拒绝沙箱的两个加固参数，容器在启动时就会死掉：
+
+```
+exec /sbin/docker-init: operation not permitted     # --init
+exec /usr/bin/sleep: operation not permitted        # --security-opt no-new-privileges
+```
+
+这是 snapd 的限制（[LP#1908448](https://bugs.launchpad.net/snapd/+bug/1908448)），不是 Hermes 能绕过的。要么改用 Docker 官方 apt 仓库安装 Docker（首选 —— 所有加固都保留），要么显式选择加入：
+
+```yaml
+terminal:
+  docker_snap_compat: true   # 去掉 --init 和 no-new-privileges；cap-drop、tmpfs、PID 限制保留
+```
+
+开启后，沙箱内的僵尸进程不再由 init 回收，容器内的 setuid 二进制可以重新获得特权；容器启动时会记录一条警告。
+
 ### 可选：将启动目录挂载到 `/workspace`
 
 Docker 沙箱默认保持隔离。Hermes **不会**将您当前的宿主工作目录传入容器，除非您明确选择加入。
@@ -593,6 +615,19 @@ hermes config set skills.config.myplugin.path ~/myplugin-data
 
 有关在您自己的技能中声明配置设置的详细信息，请参阅[创建技能 — 配置设置](../developer-guide/creating-skills.md#config-settings-configyaml)。
 
+### 每个会话自动加载技能 {#auto-loading-skills-every-session}
+
+固定技能，使其在每个新会话开始时、在每个界面上都完整加载：
+
+```yaml
+skills:
+  auto_load:
+    - my-workflow
+    - github-pr-workflow
+```
+
+在首次构建系统提示时每会话解析一次（因此提示保持缓存稳定；修改在下一会话生效）。缺失或已禁用的技能会给出警告并被跳过；`--ignore-rules` / `HERMES_IGNORE_RULES=1` 会抑制该列表。按 profile 作用域。参见 [CLI —— 通过配置持久自动加载](./cli.md)。
+
 ### Agent 创建技能写入的守卫
 
 当 agent 使用 `skill_manage` 创建、编辑、修补或删除技能时，Hermes 可以选择扫描新/更新的内容以查找危险关键字模式（凭据收集、明显的 prompt 注入、数据外泄指令）。扫描器**默认关闭** —— 合法触及 `~/.ssh/` 或提及 `$OPENAI_API_KEY` 的真实 agent 工作流触发启发式规则过于频繁。如果您希望扫描器在 agent 的技能写入落地前提示您，请重新开启：
@@ -604,6 +639,17 @@ skills:
 
 开启后，任何被标记的 `skill_manage` 写入都会以审批提示的形式出现，并附带扫描器的理由。接受的写入落地；拒绝的写入向 agent 返回解释性错误。
 
+### 技能写入的写入审批 {#write-approval-for-skill-writes}
+
+独立于上面的内容扫描器，`skills.write_approval` 会把**每一次** agent 技能写入（创建 / 编辑 / 修补 / 删除 / 支持文件）挡在你的显式审批之后 —— 与危险命令相同的批准/拒绝机制：
+
+```yaml
+skills:
+  write_approval: false   # false = 自由写入（默认）| true = 每次写入都暂存待审
+```
+
+开启后，技能写入会暂存到 `~/.hermes/pending/skills/`，并通过 `/skills pending`、`/skills diff <id>`、`/skills approve <id>`、`/skills reject <id>` 审阅 —— 可在 CLI 或任何消息平台使用。运行时用 `/skills approval on|off` 切换。内存有相同的门禁（`memory.write_approval`，见下文）。完整演练：[门控 agent 技能写入](./features/skills.md)。
+
 ## 内存配置
 
 ```yaml
@@ -612,6 +658,26 @@ memory:
   user_profile_enabled: true
   memory_char_limit: 2200   # ~800 tokens
   user_char_limit: 1375     # ~500 tokens
+```
+
+## 上下文文件截断 {#context-file-truncation}
+
+控制 Hermes 在应用头/尾截断之前从每个自动上下文文件加载多少内容。这适用于注入系统提示的文件，例如 `SOUL.md`、`.hermes.md`、`AGENTS.md`、`CLAUDE.md` 和 `.cursorrules`。它**不**影响 `read_file` 工具。
+
+```yaml
+context_file_max_chars: null  # 默认 —— 随模型上下文窗口缩放的动态上限（下限 20K，上限 500K 字符）
+```
+
+设置一个正整数即可将上限固定下来，而不是使用动态行为：
+
+```yaml
+context_file_max_chars: 25000
+```
+
+每次上下文文件读取也受 `context_file_read_timeout`（秒，默认 `5.0`）限制。读取时间超过该值的文件——通常出现在 iCloud Drive、OneDrive 或 NFS 这类网络文件系统上——会被跳过并给出警告，这样系统提示的其余部分仍能正常加载：
+
+```yaml
+context_file_read_timeout: 5.0
 ```
 
 ## 文件读取安全
@@ -663,6 +729,21 @@ tool_output:
   max_lines: 500
 ```
 
+### 工具结果溢出预算 {#tool-result-spillover-budget}
+
+与截断分开，超大的工具*结果*不会被切掉，而是溢出到磁盘：完整输出保存到 `$HERMES_HOME/cache/spillover/` 下，上下文内的内容替换为一段预览加上已保存文件的路径（可用 `read_file` 配合 `offset`/`limit` 读取，或用 `execute_code` 处理）。通用的每结果溢出阈值是 100,000 字符，并会为小上下文模型自动调低。只要任何会话的转写仍指向某个溢出文件，该文件就会保留，并在该会话被删除或修剪时随之离开；gateway 的每小时内务处理与每个进程的首次溢出只清理早于会话保留窗口（`sessions.retention_days`，默认 90 天，绝不少于 24 小时）的无引用文件，因此稍后恢复的会话仍能找到其转写所指的内容。
+
+MCP 工具结果（名为 `mcp_*` 的工具）使用更紧的 **50,000 字符**默认阈值：MCP 服务器经常返回大型未分页载荷（工具发现目录、批量执行），否则它们会落在通用阈值之下，在之后每一轮都撑大上下文。什么都不会丢 —— 完整结果保留在磁盘上。可通过以下方式覆盖阈值：
+
+```yaml
+tool_budget:
+  mcp_result_size_chars: 50000   # mcp_* 工具的每结果溢出阈值
+```
+
+MCP 阈值始终封顶于（可能按上下文缩放的）通用每结果阈值，因此调高它也无法超过活跃模型窗口允许的范围。
+
+Hermes 还会标记**provider 侧省略**：当 MCP 或 web 工具结果内嵌了自己的截断标记（`...N more items`、`"has_more": true`、"saved to sandbox" 说明）时，会在结果后附加一行提示，警告可见数据不完整，在把任何枚举当作完整之前应先分页/抓取。
+
 ## 全局工具集禁用
 
 要在 CLI 和每个 gateway 平台上统一禁用特定工具集，请在 `agent.disabled_toolsets` 下列出其名称：
@@ -698,7 +779,7 @@ worktree: true    # 始终创建 worktree（与 hermes -w 相同）
 node_modules/
 ```
 
-## 上下文压缩
+## 上下文压缩 {#context-compression}
 
 Hermes 自动压缩长对话以保持在模型的上下文窗口内。压缩摘要器是一个单独的 LLM 调用 —— 您可以将其指向任何 provider 或端点。
 
@@ -775,8 +856,62 @@ auxiliary:
 | `nous` / `openrouter` / 等 | 未设置 | 强制使用该 provider，使用其认证 |
 | 任意 | 已设置 | 直接使用自定义端点（忽略 provider） |
 
+### 流式进展超时 {#stream-progress-timeout}
+
+当摘要以流式方式返回时（压缩在 chat-completions 和 Responses 路由上始终流式，例如 `openai-codex` 或自定义 OpenAI 兼容端点），有两个超时生效，且相互独立：
+
+- `auxiliary.compression.timeout` —— 整个请求的预算（默认 120s）。
+- `auxiliary.compression.no_progress_timeout` —— 流在没有**实质性**事件（文本/推理增量或完成的输出项）的情况下可以持续多久，之后该尝试中止（`... stream stalled: no new output for Ns`），由常规的重试/回退链接管。未设置时默认 **60s**。在 chat-completions 流上，窗口从第一个 token 开始。在此之前，远程端点适用主循环的陈旧容忍度（设置了 provider 的 `providers.<id>.stale_timeout_seconds` 时用它，否则 180s，大提示会提高，o3 或 DeepSeek R1 这类推理模型提高到 600s；上限为 `timeout`），因此静默思考的模型不会被切断。在本地端点（localhost、LAN、Tailscale）上，静默预填充只受 `timeout` 约束。同一规则适用于每个流式辅助任务，包括 MoA 参考调用。保活与生命周期帧（`response.in_progress`、ping）不计为进展；每个实质性事件都会重新武装窗口，因此缓慢但仍在推进的摘要永远不会被它切断。
+
+单独调高 `timeout` **不会**拓宽进展窗口 —— 一个配置为 600s 的请求在 60s 间隙后仍会中止。请设置 `no_progress_timeout` 来改变该间隙；有效窗口封顶于 `timeout`，宿主的硬截止/取消仍然优先。宿主自身的不活动预算在这里是外层上限：agent 内压缩在摘要器静默 `compression.context_timeout_seconds`（默认 120s，下限为有效的 `auxiliary.compression.timeout`，后者本身至少 300s）后放弃，gateway 内务处理在 `compression.hygiene_timeout_seconds`（默认 30s）后放弃，因此大于适用宿主预算的 `no_progress_timeout` 会被它静默截短。该键是按任务设置的（`auxiliary.<task>.no_progress_timeout`），因此为压缩放宽它不会改变其他辅助任务。不是正数的值会被忽略，并在日志中给出警告，然后应用 60s 默认值。
+
+```yaml
+auxiliary:
+  compression:
+    provider: openai-codex
+    timeout: 600
+    no_progress_timeout: 180   # 在长时间推理摘要上容忍 3 分钟的静默间隙
+```
+
 :::warning 摘要模型上下文长度要求
 摘要模型**必须**具有至少与您的主 agent 模型一样大的上下文窗口。压缩器将对话的完整中间部分发送给摘要模型 —— 如果该模型的上下文窗口小于主模型的，摘要调用将因上下文长度错误而失败。发生这种情况时，中间轮次将**在没有摘要的情况下被丢弃**，静默丢失对话上下文。如果您覆盖模型，请验证其上下文长度满足或超过您的主模型。
+:::
+
+## Gateway 轮次租约超时 {#gateway-turn-lease-timeout}
+
+gateway 按解析后的会话 ID 串行化轮次，使两个路由键无法并发加载和写入同一份转写记录。可以独立于常规的 agent 非活动超时来配置最大租约等待时间：
+
+```yaml
+agent:
+  gateway_turn_lease_timeout: 5
+```
+
+如果该预算到期时另一个轮次仍持有会话租约，Hermes 会失败即关闭（fail closed）：它不会加载转写记录，也不会为等待中的消息运行模型。用户会收到拒绝通知并必须重发。Hermes 不会自动重排该消息，因为在没有持久化排序和幂等性的情况下这样做可能导致它被处理两次。非正值使用 5 秒默认值。
+
+## Gateway 重启排空 {#gateway-restart-drain}
+
+当 gateway 停止或重启时（SIGTERM、`hermes update`、`hermes gateway stop`，或 `hermes gateway restart` / `/restart` 的最后阶段），`agent.restart_drain_timeout` 决定它在中断进行中的聊天轮次之前允许多少秒继续运行：
+
+```yaml
+agent:
+  restart_drain_timeout: 0          # 默认：立即中断进行中的聊天轮次
+  cron_drain_timeout: 30            # cron 任务与 api_server（/v1）运行的排空下限
+  restart_after_turn_timeout: 1800  # /restart 与 `gateway restart`：在停止之前等待轮次
+```
+
+使用默认值 `0` 时，重启会立即中断正在运行的轮次。该轮次以 interrupted 状态结算且不会再次运行；TUI 和桌面端会在该轮次上显示 "Gateway restarting"（或 "Gateway shutting down"）提示，你在 Hermes 重新连接后重发消息即可。排在它后面的消息会被保留，并按顺序在新 gateway 上运行。
+
+如果你更希望让轮次跑完，请设置一个正值：
+
+```yaml
+agent:
+  restart_drain_timeout: 60
+```
+
+更长的排空会让每次重启和更新最多等待同样长的时间。`HERMES_RESTART_DRAIN_TIMEOUT` 会覆盖配置值。
+
+:::caution systemd 的 `TimeoutStopSec`
+生成的 systemd unit 会依据该值设定 `TimeoutStopSec`：取 `restart_drain_timeout` 与 `cron_drain_timeout` + 10 s 中的较大者，再加上 30 s 余量，且至少 60 s（`gateway/restart.py`、`resolve_systemd_timeout_stop_sec`）。如果你调高 `restart_drain_timeout`，请重新运行 `hermes gateway install`，以便该 unit 采用新的预算。否则 systemd 会在 gateway 排空的过程中用 SIGKILL 干掉它。launchd 把停止超时限制在 60 s，因此在 macOS 上排空受限于这段时间内能完成的部分。
 :::
 
 ## 会话卡死监视器（Session Stall Watchdog）
@@ -796,6 +931,44 @@ Gateway 运行一个仅通知的卡死监视器（`agent.session_stall_timeout`�
 ```yaml
 agent:
   session_stall_timeout: 300   # 秒；0 禁用监视器
+```
+
+## 重连关注升级 {#reconnect-attention-escalation}
+
+当某个平台适配器连接失败时（网络中断、bot token 被撤销、sidecar 损坏），gateway 会以有上限的指数退避无限重试——重试永不停止，因此瞬时中断总能自行恢复，无需运维介入。代价是*永久性*失败（Telegram token 被撤销、缺少 Discord privileged intents）看起来和一次抖动完全一样：永远显示 "retrying"。
+
+有两种机制让永久性失败可见：
+
+- **终态分类。** 异常*类型*证明永远无法自愈的失败——被拒绝/撤销的 token（`telegram_auth_error`、`discord_auth_error`、`email_auth_error`）、缺少 privileged intents（`discord_intents_required`）、依赖无法安装（`SIDECAR_DEPS_MISSING`）或 node 二进制缺失（`SIDECAR_NODE_MISSING`）的 Photon sidecar——会被标记为致命，而不是进入重试队列。分类严格基于类型；有歧义的错误一律继续重试。
+- **需要关注升级。** 某个平台持续留在重试队列中超过 `agent.reconnect_attention_after`（默认 `7200` 秒 = 2 小时，`0` 禁用）后，会在 gateway 运行时状态（`hermes status`）中得到 `needs_attention: true` 和 `retrying_since` 时间戳，并记录一条 WARNING 日志。重试行为不变——这是一个信号，不是熔断器。该标志在成功重连后清除。
+
+```yaml
+agent:
+  reconnect_attention_after: 7200   # 秒；0 禁用该升级标志
+```
+
+## Gateway Agent 缓存 {#gateway-agent-cache}
+
+gateway 为每个会话保留一个 agent，使对话复用其缓存的提示前缀，而不是每轮重建系统提示。该缓存的 agent 还持有会话的完整转写——包括工具输出，在一个有上百次工具调用的会话上可达数十 MB。因此在繁忙的多平台 gateway 上，该缓存是进程中内存占用的最大单一来源。
+
+```yaml
+agent:
+  agent_cache:
+    max_size: 128            # LRU 条目上限
+    idle_ttl_secs: 3600      # 淘汰空闲这么久的 agent
+    memory_high_mb: auto     # 匿名 RSS 预算；数字、"auto" 或 0/off
+    max_evictions_per_pass: 16
+    protect_recent: 8
+```
+
+`max_size` 和 `idle_ttl_secs` 分别按数量和按时间限制缓存。两者都不知道自己占了多少字节，因此 `memory_high_mb` 增加了第三重限制：一旦匿名内存越过预算，就丢弃最近最少使用的转写，这些转写会在下一轮从已存储的会话中重新加载。如果 gateway 正在与其他服务争抢内存，就调低它；如果你更愿意让所有前缀保持热态，就调高它（或设为 `0` 关闭该轮清理）。
+
+`auto` 从 gateway 实际运行所遵循的内存限制推导预算——容器或 systemd unit 的 cgroup 限制，否则为总 RAM——因此 unit 上的 `MemoryMax`/`MemoryHigh` 会被尊重，无需再维护第二个数字。在这种限制下，测量也以同样方式限定范围：cgroup 自身的匿名内存计费（`memory.stat` 的 `anon`），其中包含 `execute_code` 内核和终端命令这类计入该 unit 限制的子进程。没有上限时，测量的是 gateway 自身的匿名 RSS。
+
+进行中的轮次、`protect_recent` 个最近使用的会话，以及任何转写尚未写完落盘的会话永不会被丢弃。淘汰会以 WARNING 级别记录测得的 RSS 和被丢弃的会话：
+
+```
+Agent cache pressure: anon RSS 6802MB over budget 6656MB — evicting 5 LRU session(s): ...
 ```
 
 ## 上下文引擎
@@ -853,6 +1026,68 @@ Hermes 对流式传输有单独的超时层，以及用于非流式调用的陈�
 
 周期性的提供商等待提示仅在至少 **60 秒没有响应活动**后显示。Codex Responses 的**等待状态**描述的是没有流事件的时间，而不是生成的总时长：持续收到流事件（包括推理内容）时不会显示等待警告。如果事件停止，提示会显示多久没有收到流事件，而不会声称尚未收到任何响应；事件恢复后提示会清除。当重连进入新的首事件看门狗阶段时，等待状态也会跟随该阶段。这只影响状态显示，不会延长独立的调用总时长限制，也不会更改看门狗超时。Chat Completions 流同样会在数据块恢复时及时清除无输出警告，但不会覆盖本地模型加载状态。
 
+### 禁用 API 流式传输 {#disabling-api-streaming}
+
+`model.streaming: false` 会为整个会话强制使用非流式请求 —— 父 agent 与 subagent 都一样。它是给自托管 OpenAI 兼容服务器的逃生通道：这些服务器的*流式*工具调用路径是坏的（例如 vLLM 配合 `--tool-call-parser qwen3_xml` 和推理解析器时，工具调用标记可能泄漏进纯文本并返回零个 `tool_calls`，导致委派任务静默空转）。默认 `true`；除非你遇到这类 bug，否则请保持默认，因为非流式调用会失去上文描述的活性属性。这与 `display.streaming` 无关，后者只控制终端中的 token 渲染。
+
+当流式无法推进时，Hermes 也会自行把会话切到非流式：provider 报告不支持流式，或某个 OpenAI 兼容网关用无内容的 SSE 帧（只有 `data:` / `event: ping` 保活、没有载荷，常见于降级的中继）回应流式请求。该轮次会在无流式的情况下重试，显示警告，并且该会话剩余时间保持流式关闭。
+
+```yaml
+model:
+  streaming: false
+```
+
+## 墙钟运行预算 {#wall-clock-run-budget}
+
+独立于迭代预算，你可以为每次会话运行设置一个可选的**墙钟**预算。它面向在外部硬上限下运行的一次性调用与 eval-harness 调用（例如每个任务 900 秒的限制）：没有它，一次运行可能在活儿基本干完时超时——差一次生成就能输出最终答案，或者卡在一个挂起的 provider 调用上。
+
+```yaml
+agent:
+  run_budget_seconds: null     # 可选；未设置/null = 该功能完全关闭（默认）
+```
+
+或通过 CLI 按次调用：
+
+```bash
+hermes chat --run-budget 850 -q "..."
+```
+
+设置预算后，会发生两件事：
+
+1. **80% 时的收尾提示。** 当预算用掉 80% 时，Hermes 会注入一条**一次性**提示（以缓存安全的方式投递，附加到最新的工具结果上，类似 `/steer` 消息），告知模型停止新的发现/验证工作，并基于已有状态产出最终交付物。每次运行最多触发一次，机制与现有的迭代预算收尾一致——不会有重复的压力警告。
+2. **按截止时间缩放的陈旧超时。** 隐式的非流式陈旧超时（90 秒默认值以及推理模型的保底值，例如 DeepSeek 推理模型的 600 秒）会被限制在 `max(60, 剩余预算 × 0.5)`，因此一次静默挂起的 provider 调用永远无法吃掉运行的剩余时间。该上限只会*收紧*超时——绝不上调——而显式配置的 `stale_timeout_seconds`（provider/模型配置或 `HERMES_API_CALL_STALE_TIMEOUT`）始终原样优先。
+
+该预算按 `run_conversation` 轮次计算（每条用户消息都会重置），未设置时该功能完全休眠——不读时钟、不注入、不改超时。
+
+## 停止前验证（编码验证） {#verify-on-stop-coding-verification}
+
+启用后，如果 agent 在工作区编辑了代码却没有产生新的验证证据（一次通过的测试运行、构建、lint 等），Hermes 会拒绝在该轮次接受最终答案——它会注入一条合成追问，要求 agent 进行验证或解释为什么不能。纯文档/markdown/技能编辑不会触发它，且该循环有界，绝不会困住 agent。
+
+```yaml
+agent:
+  verify_on_stop: false        # true | false | "auto"（感知表面：CLI/TUI/桌面端开启，消息平台关闭）
+  verify_guidance: true        # 在缺少证据的提醒中附加创意 UI / 干净 diff 的指导
+  max_verify_nudges: 3         # 每轮连续 continue 提醒的上限（内置 + pre_verify 钩子）
+  coding_instructions: ""      # 追加到编码简报的项目级长期编码规则
+```
+
+`verify_on_stop` 接受 `true`（处处开启）、`false`（关闭——默认）或 `"auto"`（旧版感知表面行为：交互式编码表面——CLI、TUI、桌面端——以及程序化调用者开启；Telegram/Discord 这类消息表面关闭，因为验证叙述在聊天里读起来像噪音）。默认处处关闭：全新安装为 `false`，而配置迁移在既有安装上把它关掉了，所以启用它是显式选择加入。`HERMES_VERIFY_ON_STOP` 环境变量在设置后覆盖配置值。
+
+为该守卫提供依据的证据（跑了哪些 test/lint/build 命令、自那以后编辑了哪些文件）存放在 `~/.hermes/verification_evidence.db`。该账本只在守卫启用期间写入或创建；`verify_on_stop: false` 时不会记录任何内容，已有文件可以随意删除。
+
+如果需要在同一点上加一个用户/插件策略门——用你自己的检查让 agent 继续——请参阅 `pre_verify` 钩子（见 [hooks](./features/hooks.md)）。
+
+## 常驻目标（`/goal`） {#standing-goals-goal}
+
+当常驻目标处于活动状态时，Hermes 会判定每条助手响应是否满足该目标。若不满足，它会把一条继续提示送回同一会话，并持续工作直到目标完成、轮次预算耗尽，或用户暂停/清除它。轮次预算是真正的兜底——判定失败时**放开**（继续），因此一个不稳定的判定器永远不会卡住进展。
+
+```yaml
+goals:
+  max_turns: 20   # Hermes 自动暂停目标前允许的最大继续轮次（默认：20）
+```
+
+`max_turns` 限制一个目标在 Hermes 自动暂停并要求用户 `/goal resume` 之前能驱动多少继续轮次。它可防止判定器的假阴性（目标其实已完成但判定器说继续）以及在模糊或无法达成的目标上无界的模型开销。完整功能见 [目标](./features/goals.md)。
+
 ## 上下文压力警告
 
 与迭代预算压力分开，上下文压力跟踪对话距**压缩阈值**有多近 —— 即上下文压缩触发以摘要旧消息的点。这有助于您和 agent 了解对话何时变长。
@@ -890,7 +1125,7 @@ credential_pool_strategies:
 
 选项：`fill_first`（默认）、`round_robin`、`least_used`、`random`。完整文档请参阅[凭据池](./features/credential-pools.md)。
 
-## Prompt 缓存
+## Prompt 缓存 {#prompt-caching}
 
 当活跃 provider 支持时，Hermes 自动开启跨会话 prompt 缓存 —— 无需用户配置。
 
@@ -926,6 +1161,18 @@ $ hermes model
 ```
 
 选择任务，选择 provider（OAuth 流程打开浏览器；API 密钥 provider 提示输入），选择模型。更改持久化到 `config.yaml` 中的 `auxiliary.<task>.*`。与主模型选择器相同的机制 —— 无需学习额外语法。
+
+### 仅流式端点 {#stream-only-endpoints}
+
+一些 OpenAI 兼容端点直接拒绝非流式 chat 请求（例如腾讯 Copilot 返回 HTTP 400 `"Non-stream chat request is currently not supported"`）。交互式聊天本来就流式，但辅助任务（标题生成、压缩、视觉）使用非流式调用，会在每次尝试时失败。Hermes 始终把 `copilot.tencent.com` 视为仅流式；对于其他这类端点，请在 `auxiliary.stream_only_base_urls` 下列出 URL 子串：
+
+```yaml
+auxiliary:
+  stream_only_base_urls:
+    - "my-stream-only-proxy.example.com"
+```
+
+匹配的辅助调用会以 `stream=True` 发送，数据块（包括工具调用增量）在客户端聚合 —— 其他端点行为不变。
 
 ### 视频教程
 
@@ -969,7 +1216,7 @@ Hermes 中的每个模型槽位 —— 辅助任务、压缩、回退 —— 使
 
 **后台审查有所不同：** 与主会话使用同一模型的审查分支始终继承主会话的推理强度；`auxiliary.background_review.reasoning_effort` 在这条路径上不会生效，即使显式指定了主会话的 provider/model 也一样。推理设置、系统 prompt、完整会话快照和工具定义保持逐字节一致，以复用 prompt 缓存前缀。没有用于同模型审查的独立推理强度开关。详见[同模型审查的推理强度](./features/memory.md#same-model-review-reasoning)。路由到其他模型时的独立问题见 [#94825](https://github.com/NousResearch/hermes-agent/issues/94825)。
 
-### 完整辅助配置参考
+### 完整辅助配置参考 {#full-auxiliary-config-reference}
 
 ```yaml
 auxiliary:
@@ -1065,6 +1312,25 @@ auxiliary:
 | `base_url` | （可选）自定义 OpenAI 兼容端点 |
 
 `fallback_chain` 适用于任何辅助任务 —— `compression`、`vision`、`approval`、`skills_hub`、`mcp` 等。
+
+### 限制辅助并发 {#limiting-auxiliary-concurrency}
+
+`max_concurrency` 限制整个进程中 `compression`、`title_generation` 这类辅助任务的在飞 LLM 调用数。`auxiliary.vision.max_concurrency` 除外：它本来就只控制视觉的 CPU 密集型图像编码/缩放 worker，而不是 LLM 请求。这在以下情况最有用：
+
+- 许多会话可能同时派生后台工作（Discord/Telegram 频道、多个终端）
+- 你的 provider 受限速或正处于故障，重试会放大突发流量
+
+默认不限。典型的安全上限是 `2`：
+
+```yaml
+auxiliary:
+  title_generation:
+    max_concurrency: 2
+  compression:
+    max_concurrency: 2
+```
+
+信号量包裹整个调用（包括重试和回退），因此一次缓慢的调用只占用一个名额。
 
 ### OpenRouter 路由和辅助任务的 Pareto Code
 
@@ -1229,15 +1495,143 @@ agent:
 
 未设置时（默认），推理努力程度默认为"medium" —— 适合大多数任务的平衡级别。设置值会覆盖它 —— 更高的推理努力程度在复杂任务上提供更好的结果，但代价是更多 token 和延迟。
 
+### 回答长度（`text_verbosity`）
+
+Responses-API 模型（OpenAI GPT-5 系列及更新、OpenAI 直连、ChatGPT Codex 与 Azure 路由）还接受一个独立的旋钮，控制最终自然语言回答的长度，与推理深度无关：
+
+```yaml
+agent:
+  text_verbosity: ""   # 空 = 不发送（provider 默认值）。选项：low、medium、high
+```
+
+Hermes 仅在 Responses 家族路由上把它作为顶层 `text: {verbosity: ...}` 字段发送；它绝不会出现在 `chat_completions`、Anthropic 或 xAI 请求上，空值或未知值则什么都不发。通过 `request_overrides` 设置的结构化输出（`text.format`）会原样传递。
+
+:::note 经 OpenRouter 的自适应思考模型（Claude 4.6+、Fable/Mythos 级）
+这些模型使用*自适应*思考，不接受常见的 `reasoning.effort` 字段 —— OpenRouter 对它们忽略该字段。Hermes 会透明地把你的 `reasoning_effort` 路由到 OpenRouter 的 `verbosity` 参数（映射到 Anthropic 的 `output_config.effort`），因此同一个努力程度旋钮在所选模型支持的级别上继续工作。`none`（或未设置）让模型保持自己的自适应默认值。原生 Anthropic provider 直接控制努力程度，不受影响。
+:::
+
+:::note OpenRouter 模型与支持的努力级别
+对于经 OpenRouter 路由的其他模型，Hermes 读取实时模型目录的推理元数据（`supported_parameters` 加每个模型的 `reasoning.supported_efforts`）来决定是否发送推理控制，并把请求的努力程度钳制到该路由实际支持的最接近级别（始终向下 —— 例如在止步于 `high` 的路由上，`ultra` 会变成 `high`，绝不会静默升级）。新的支持推理的厂商无需等待 Hermes 更新即可工作；当目录不可达或模型未列出时，Hermes 回退到内置的模型家族列表，并原样传递你的努力程度。
+:::
+
+:::note `ultra` 会被钳制到路由接受的最强级别
+`ultra` 是 Hermes 内部的阶梯步：没有任何 provider 线路接受它，因此每条路由都会把它钳制到自己的最强级别（GPT-5.6 Codex 和 OpenAI 兼容路由为 `max`，更老的 Codex 模型为 `xhigh`）。努力程度选择器和 `/reasoning` 状态会显示 `ultra (sends max on this route)`，因此你看到的级别就是实际发送的级别。
+:::
+
 您也可以在运行时使用 `/reasoning` 命令更改推理努力程度：
 
 ```
-/reasoning           # 显示当前努力程度和显示状态
-/reasoning high      # 将推理努力程度设为 high
-/reasoning none      # 禁用推理
-/reasoning show      # 在每次响应上方显示模型思考
-/reasoning hide      # 隐藏模型思考
+/reasoning                # 显示当前努力程度和显示状态
+/reasoning high           # 将推理努力程度设为 high（仅本次会话）
+/reasoning high --global  # 设置并持久化到 config.yaml
+/reasoning none           # 禁用推理（仅本次会话）
+/reasoning show           # 在每次响应上方显示模型思考
+/reasoning hide           # 隐藏模型思考
 ```
+
+努力程度更改默认作用域为当前会话；加上 `--global` 可把新级别保存为 `agent.reasoning_effort` 默认值。
+
+#### 按模型覆盖推理设置
+
+可以为不同模型设置不同的推理努力程度。当你希望对复杂模型用高推理、对更快的模型用中等推理时很有用：
+
+```yaml
+agent:
+  reasoning_effort: "medium"       # 全局默认
+  reasoning_overrides:
+    "openrouter/anthropic/claude-opus-4.5": "xhigh"
+    "openai/gpt-5": "low"
+    "claude-sonnet-4.6": "high"    # 裸模型名同样有效
+```
+
+键的匹配是**容忍拼写差异的** —— 任何合理的拼写都能匹配：
+- `claude-opus-4.5`、`claude-opus-4-5`、`claude-opus.4.5`（点和横线可互换）
+- `anthropic/claude-opus-4.5`、`openrouter/anthropic/claude-opus-4.5`（provider 前缀可选）
+- 以具名自定义 provider 为前缀的键（`ollama-local/qwen3.6:27b-q4_k_m`）在请求只携带裸模型 id（`qwen3.6:27b-q4_k_m`，即回退条目和 `providers:` 路由所发送的形式）时同样适用
+- 精确匹配优先于各种变体
+
+#### 自定义推理档位名称
+
+一些 OpenAI 兼容端点提供标准阶梯之外的思考档位（例如提供 `fast`/`thinking` 而非 `low`…`max` 的中继）。阶梯之外的裸字符串会被拒绝并提示 `Unknown reasoning_effort '<value>', using default (medium)`，因此笔误永远到不了线路。要请求 provider 自己的档位名，请使用显式的字典形式 —— `effort` 值会逐字作为顶层 `reasoning_effort` 字段发送：
+
+```yaml
+agent:
+  reasoning_effort:
+    enabled: true
+    effort: thinking            # 原样发送
+  reasoning_overrides:
+    "my-relay/lumo-max":        # 字典形式也可以按模型设置
+      enabled: true
+      effort: fast
+```
+
+字典形式中的 `enabled: false` 会关闭思考，等同于 `reasoning_effort: none`。
+
+字典形式只能通过直接编辑 `config.yaml` 设置：`/reasoning` 菜单、`hermes model` 和仪表盘的辅助模型选择器只提供标准阶梯（配置后，TUI 状态和设置向导仍会显示自定义档位名）。
+
+:::note
+模型 id 含点（`claude-opus-4.5`、`qwen3.6:27b`），`hermes config set` 会把点当作嵌套分隔符。用反斜杠转义即可写入字面键 —— `hermes config set 'agent.reasoning_overrides.ollama-local/qwen3\.6:27b-q4_k_m' low` —— 或直接编辑 YAML。参见[键名中的点](../reference/cli-commands.md)。
+:::
+
+:::note OpenAI Responses（`openai-api`、`openai-codex`）
+在接受该字段的模型上（GPT-5.x），`reasoning_effort: none` 会被显式发送为 `reasoning.effort: "none"`：省略该字段会让模型保持默认努力程度（GPT-5.6 默认为 `medium`）。只有未设置努力程度才是省略该字段的唯一状态。`api.openai.com` 上的 Chat 时代模型（`gpt-4o`、`gpt-4.1` 及其 `-mini` 变体和微调版本）拒绝任何 `reasoning` 参数，因此 Hermes 对它们一律不发送，无论配置的努力程度如何，而不是以 `400 Unsupported parameter: 'reasoning.effort'` 失败。如果模型拒绝 `none`，Hermes 会给出警告，为该会话放弃禁用，并以模型默认值重试。
+:::
+
+:::note 本地 OpenAI 兼容端点
+自定义 `base_url`（`http://localhost:11434/v1`、vLLM、SGLang 或 router 端点）会以标准顶层 `reasoning_effort` 请求字段收到解析后的努力程度 —— `agent.reasoning_effort` 或匹配的按模型覆盖 —— 并钳制到 OpenAI 兼容线路接受的值（`none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`）。此处未设置的努力程度也会以 `medium` 发送，与 Nous Portal 和 OpenRouter 路由应用的默认值相同 —— 省略该字段等于把选择权交给端点，而托管推理模型自己的默认值可能就是它的上限（kimi-k3 默认为 `max`：推理 token 和延迟约为 `medium` 的 3 倍）。对于目录或 `model_overrides` 标记为 `supports_reasoning: false` 的模型、未带 `thinking` 能力拉取的本地 Ollama 模型，以及端点对该字段返回 `400` 之后的会话剩余时间，该字段保持关闭。嵌套的 `reasoning` 对象只保留给已知接受它的端点（Nous Portal、支持推理的 OpenRouter 模型、GitHub Models），因为任意服务器会用 HTTP 400 拒绝未知字段。如果你的服务器从不同字段读取思考预算（Ollama 的 `think`、vLLM 的 `chat_template_kwargs`、某个 router 专用键），请把它设置在自定义 provider 的 [`extra_body`](../integrations/providers.md) 下，该字段会合并进路由到那里的每个请求。
+:::
+
+**解析优先级：**
+
+1. 会话级的 `/reasoning --session` 覆盖（仅 gateway）
+2. `agent.reasoning_overrides` 中的按模型覆盖（容忍拼写差异）
+3. 全局 `agent.reasoning_effort`
+4. provider 默认值
+
+该覆盖会自动在所有场景生效：CLI 启动、`hermes -p` 一次性运行、消息 gateway、Desktop/TUI、ACP 会话、cron 任务、会话中途的 `/model` 切换（包括在第一条消息之前发出的切换）、会话恢复（`--resume`、`/resume`）、`/new`，以及回退模型激活。
+
+## Fast 模式 {#fast-mode}
+
+Fast 模式以更高的价格向 provider 请求更快的输出：OpenAI 的 [Priority Processing](https://openai.com/api-priority-processing/)（`service_tier: priority`）以及在受支持的 OpenAI 模型上的 Ultrafast（`service_tier: ultrafast`），Grok 4.6 上的 xAI Priority Processing，以及 Anthropic 的 [Fast Mode](https://platform.claude.com/docs/en/build-with-claude/fast-mode)（`speed: fast`，仅限 Opus 4.8 / Opus 5 / Opus 5.5）。`openai` 与 `openai-api` 两个 provider 走 OpenAI 第一方端点。它**默认关闭**。
+
+```yaml
+agent:
+  service_tier: ""          # "" / normal | fast | priority | ultrafast | auto | cold
+  fast_auto_seconds: 60     # auto / cold 的窗口
+```
+
+| 模式 | 何时发送 fast 参数 | 适用场景 |
+|------|---------------------------|------------|
+| `normal`（默认，`""`） | 从不 | 最便宜；标准延迟 |
+| `fast` | 每个请求 | 你总是想要速度的长交互会话 |
+| `auto` | **每一**轮开头 `fast_auto_seconds` 内的请求 | 首条回复更利落；长时间工具循环回落到标准计费 |
+| `cold` | 同一窗口，但仅限会话的**第一轮**（无历史） | 快速的入驻回复，之后按标准计费 |
+
+`/fast normal|fast|ultrafast|auto|cold` 为当前会话切换模式（`/fast ultra` 是 `ultrafast` 的简写）。在 ChatGPT/Codex 订阅下，只有当你账号的 Codex 模型目录为当前模型列出了 Ultrafast 时才会提供该模式；否则后端仍会接受请求并按标准速度服务。加上 `--global` 可持久化到 `config.yaml`。单独使用 `/fast` 会显示当前模式。
+
+**成本提示：** 两个 provider 都对 fast 请求按标准费率的倍数计费（Anthropic：Opus 5.5 为 $8 / $40 每百万 token 输入/输出，Opus 5 和 Opus 4.8 为 $10 / $50），并与 prompt 缓存价格叠加。Hermes 依据 API 在 `usage.speed` 中报告的速度来为每条 Anthropic 响应计价。`auto`/`cold` 只把这份溢价限制在窗口内。fast 参数只发给支持它们的第一方端点（`api.openai.com` / Codex 订阅、`api.anthropic.com`、`api.x.ai`）；OpenRouter、Nous Portal、Azure、Bedrock 和自定义 `base_url` 路由在任何模式下都不会收到它们。
+
+**Prompt 缓存：** 请求之间只有这个按请求的参数在变；system prompt、工具和消息保持逐字节一致。Anthropic 为每种速度维护独立的 prompt 缓存，因此在 Anthropic 上，每个 `auto`/`cold` 窗口边界都会以新速度重写对话前缀。对较长的 Anthropic 会话，`fast` 或 `normal` 能保持一份热的缓存。
+
+Fast 模式的加速体现在每秒输出 token 数上，因此长回答收益最大。
+
+当某个 Anthropic 组织对某个模型没有 fast 模式容量（API 对 fast 请求返回 fast-mode 上限 0）时，Hermes 会在该会话剩余时间内把该模型切到标准速度并重试该请求。
+
+### 网关或代理后的 Fast 档位 {#fast-tiers-behind-a-gateway-or-proxy}
+
+仅限第一方这条规则是有意为之：fast 档位参数是一条计费指令，Hermes 只会把它发给价格表已知的端点。如果你运行的是暴露自家优先档位的 OpenAI 兼容网关、路由器或代理（自家的 `service_tier` 值，或字段名不同），请通过该 provider 的 `extra_body` 请求它，而不是 `agent.service_tier`。[具名自定义 provider](../integrations/providers.md) 上的 `extra_body` 会合并进路由到该端点的**每一个** chat-completions 请求，能跨 gateway 轮次和 `/fast` 切换持续存在，并在你通过 `/model` 离开该 provider 时再次被丢弃：
+
+```yaml
+providers:
+  my-gateway:
+    api: https://gateway.example.com/v1
+    key_env: MY_GATEWAY_KEY
+    default_model: fast-lane-model
+    extra_body:
+      service_tier: priority     # 你的网关文档中的档位值
+```
+
+与 `agent.service_tier` 的差别：该档位对该 provider 始终开启（没有 `auto`/`cold` 窗口），`/fast` 不会切换它，Hermes 也不校验该值——接受什么、怎么计费由网关决定。
 
 ## 工具使用强制
 
@@ -1275,6 +1669,97 @@ agent:
 agent:
   tool_use_enforcement: ["gpt", "codex", "gemini", "grok", "my-custom-model"]
 ```
+
+## 执行纪律指导 {#execution-discipline-guidance}
+
+与工具使用强制分开，Hermes 会为一些模型族注入一段**执行纪律**（execution-discipline）内容：这些模型族在 eval 轨迹中表现出共同的 agentic 失败模式——用散文而非代码做算术、在外部写入后跳过读回验证、"修复"格式错误的标识符、在计数不匹配的情况下声称完整、以及没有验证每一条验收标准就宣称"完成"。
+
+```yaml
+agent:
+  execution_guidance: "auto"   # "auto" | true | false | ["model-substring", ...]
+```
+
+| 值 | 行为 |
+|-------|----------|
+| `"auto"`（默认） | 对匹配以下内容的模型启用：`gpt`、`codex`、`grok`、`deepseek`、`kimi`、`qwen`、`glm`、`minimax`、`mimo`、`mistral`、`muse`。 |
+| `true` | 无论模型如何，始终启用。 |
+| `false` | 无论模型如何，始终禁用。 |
+| `["deepseek", "my-custom-model"]` | 仅当模型名包含列表中的某个子串时启用（不区分大小写）。 |
+
+注入的内容涵盖：
+
+- **工具持久性** ——持续调用工具直到任务完成*并*验证；对空、部分或可疑地狭窄的检索结果，用更宽泛或不同的查询重试后再下结论。
+- **强制使用工具** ——算术、哈希、日期、系统状态和文件事实一律来自工具，绝不来自心算。
+- **外部写入读回** ——对任何外部系统做状态变更写入后，在声称成功之前读回确切的目标（工具已确认的内部文件编辑不重复验证）。
+- **计数核对** ——声明的总数（`total`、`reply_count`、`has_more`）是硬断言；不匹配时重新获取或用程序解析。
+- **字面保留** ——绝不规范化或"修复"不符合既定格式的标识符；一次成功的查找并不能证明格式错误的源 token 有效。
+- **以验证为门槛的完成** ——"完成"意味着每一条具名验收标准都已验证，绝不是看起来合理的子集。
+
+该门槛独立于 `tool_use_enforcement`——两者可以单独开启。指导内容在会话启动时依据模型名选定一次，因此 system prompt 在整个对话期间保持逐字节稳定（对 prompt 缓存友好）。Gemini/Gemma 被排除在 auto 列表之外，因为它们会收到更具体的 Google 运营指导；Claude 被排除是因为它不表现出这些失败模式——任何模型都可以通过 `true` 或子串列表选择加入。
+
+## 工具循环护栏 {#tool-loop-guardrails}
+
+Hermes 能检测 agent 是否卡在无产出的工具调用循环中——同一次工具调用反复失败、同一个工具一次次失败，或者一个幂等调用返回相同结果而毫无进展。默认情况下，它会在工具结果中注入一条**警告**，让模型自我纠正。交互式 CLI、TUI、Desktop 和 ACP 会话保持仅警告，因为有人可以介入；无人值守的 gateway 和 cron 会话默认启用硬停止。
+
+这个感知平台的默认值可以在无人值守部署上关闭，也可以在每个平台上显式启用硬停止：
+
+```yaml
+tool_loop_guardrails:
+  warnings_enabled: true       # 向工具结果注入警告（默认：true）
+  hard_stop_enabled: false     # 超过硬停止阈值时再 BLOCK 该调用（默认：false）
+  non_interactive_hard_stop_enabled: true  # gateway/cron 的默认硬停止
+  warn_after:
+    exact_failure: 2           # 完全相同的失败调用重复 N 次
+    same_tool_failure: 3       # 同一个工具失败 N 次（参数不同）
+    idempotent_no_progress: 2  # 结果相同、无进展，N 次
+  hard_stop_after:
+    exact_failure: 5
+    same_tool_failure: 8
+    idempotent_no_progress: 5
+  loop_caps:
+    max_web_searches: 50       # 每轮最多 web_search 调用次数（0 = 不限）
+    max_subagents: 50          # 每轮最多派生的 subagent 数（0 = 不限）
+```
+
+`hard_stop_enabled` 显式在每个平台上启用硬停止。当它保持 `false` 时，`non_interactive_hard_stop_enabled` 仍会为无人值守的 gateway/cron 类平台启用硬停止，同时对 CLI、TUI、Desktop、ACP、subagent 和 `api_server` 运行（有活跃父级或客户端的受监督任务循环）保持仅警告行为。将 `non_interactive_hard_stop_enabled: false` 可让无人值守部署退出该行为。另请参阅 [Docker / 无人值守部署](docker.md)。
+
+硬停止旨在抓住**重放**——完全相同的调用、参数不变、期间什么都没有发生——而不是合理的迭代：
+
+- **编辑 → 重跑永远不算循环。** 任何成功的变更调用（`write_file`、`patch`、返回绿的 `terminal`/`execute_code`、浏览器操作、任务/消息/cron 变更）会为所有仍在计数的失败调用标记进展。下一次相同的重试（修好后再跑一次红测试、点击后重新截图）会开始新的连续计数，而不是继续累积到封锁。
+- **不同的红色命令是诊断，不是循环。** 对非零退出属于普通输出的工具（`terminal`、`execute_code`、进程轮询器、`browser_exec`、`web_extract`），`same_tool_failure` 阈值只会警告，永不中止。只有期间没有任何变更的完全相同的参数重放，或结果完全一致的连续重复，才能阻止它们。
+- **中止只结束该轮次，不结束会话。** agent 会回复是哪个护栏触发以及原因；回复 "continue" 会以新的按轮计数器继续。
+
+### 每轮失控循环上限 {#per-turn-runaway-loop-caps}
+
+与上面的基于失败的阈值分开，`loop_caps` 为单个 agent 循环（轮次）可以发起的 `web_search` 调用数和 subagent 派生数设置硬上限。计数器在每轮开始时重置，因此合理的多轮会话永远不会被饿死——但单个螺旋成无界搜索或委派循环的轮次会被叫停。这些始终开启，且不论 `hard_stop_enabled` 如何都会触发。单个轮次发出几十次 web 搜索或派生几十个 subagent 本身就是病态的，因此默认值很低。达到上限时，触发的工具调用会被阻止并给出说明消息，轮次干净地停止，而不是烧掉剩余预算。将任一值设为 `0` 可完全禁用该上限。
+
+单次 `delegate_task` 批量中的每个任务都会计入 `max_subagents`（一批 3 个消耗 3），因此该上限跟踪的是真正派生的 subagent 数，而不是 `delegate_task` 的调用次数。
+
+这与 Claude Code 的每会话 WebSearch 与 subagent 上限（v2.1.212）相似，后者默认也是 200 并在 `/clear` 时重置。
+
+### 运行时防卡死守卫 {#runtime-anti-stall-guards}
+
+作为上述基于失败护栏的补充，`agent.stall_guards`（默认 `true`）启用两个保守的运行时守卫，防止浪费轮次。第一，**相同调用循环断路器**：当同一个工具被连续调用 3 次以上且参数完全相同*并且*返回完全相同的结果时，会在该工具结果后附加一行简短提示，告诉模型不要重复该调用——在仅警告会话中它永不阻止调用，且可合理重复的轮询器（`process_manage`、`*_get_result`、`*_poll`）豁免。当硬停止生效时（显式 `hard_stop_enabled`，或无人值守的 gateway/cron 平台），同样的连续计数一旦达到 `hard_stop_after.idempotent_no_progress` 次连续相同调用，也会成为硬停止——对**任何**工具都如此，而不只是 `idempotent_no_progress` 护栏跟踪的只读工具——因此重放同一次成功 `terminal` 或 `skill_view` 调用的模型会被中止，而不是耗尽迭代预算（`identical_call_streak_halt`）。第二，**继续意图恢复**：当模型结束轮次时没有工具调用，但其简短回复以宣告某个动作的话语收尾（"Let me now update the file…"），Hermes 会通过与意图确认恢复相同的受限继续机制重新提示它行动（每轮最多 2 次重提示）。两者都是缓存安全的（提示在构造结果时添加，绝不追溯添加），并且可以一起禁用：
+
+```yaml
+agent:
+  stall_guards: false
+```
+
+同一个开关还会启用**结果引用存根**：当重新发出的相同工具调用返回逐字节相同的新结果时，重复载荷会以指向早先结果的简短引用存根进入上下文（工具名、`tool_call_id`、参数摘要，以及——如果第一个结果被持久化到磁盘——其溢出路径），而不是重复完整输出。工具仍然每次都执行，因此轮询语义得以保留：变化的结果总是完整通过。小于 512 字符的结果、错误结果和多模态结果永不做存根，而轮询器*会*做存根（未变化的轮询正是重复载荷不携带任何信息的情形）。
+
+### 轮次存活看门狗 {#turn-liveness-watchdog}
+
+`agent.turn_liveness` 限制一个对话轮次可以**毫无可观察进展**地持续多久，之后 Hermes 会强制恢复它。该看门狗依据活动时钟（与标记 API 等待、流 token 和工具心跳相同的信号——租约续期从不计入），因此一个在半空中静默卡住的轮次（issue #95548 中的观测：没有工具执行、没有 API 调用、没有错误，但会话无限期保持"忙碌"）会被醒目地暴露、被中断以便以可重试的中断轮次回卷，并且——当中断无法解开卡死时——其持久轮次租约停止续期，使陈旧轮次清理可以回收会话，而不是让它挂到进程被杀。
+
+```yaml
+agent:
+  turn_liveness:
+    timeout_s: 600.0   # 空闲上限；<= 0 禁用看门狗
+    poll_s: 15.0        # 采样间隔（秒）
+```
+
+合理的慢速工作不会被惩罚：流式响应、工具心跳（工具运行期间每 30s 一次）和审批等待都在不断触碰时钟，因此只有在整个时限内**零**进展的轮次才会触发看门狗。无效值（拼写错误、`NaN`、`Inf`、非正的 `poll_s`）会记录警告并回落到默认值——它们绝不会让启动崩溃，也绝不会静默禁用看门狗。触发的中止会在开始恢复时报告卡死，并且只有当中断真正提交后才发布最终的 aborted/lease-stopped 结果。
 
 ## TTS 配置
 
@@ -1344,7 +1829,34 @@ display:
   language: en            # 静态消息的 UI 语言（审批提示、部分 gateway 回复）。en | zh | zh-hant | ja | de | es | fr | tr | uk | af | ko | it | ga | pt | ru | hu
 ```
 
-### 文件变更验证器
+### 每轮摘要与 spinner token 流 {#per-turn-summary-and-spinner-token-flow}
+
+`display.turn_summary`（默认 `true`）在**交互式 CLI** 每轮结束后打印一行暗色统计，概述该轮实际做了什么：
+
+```
+⋯ 12.4s · edited 2 files +18 -3 · read 4 files · ran 3 commands
+```
+
+统计信息从 CLI 本来就接收的工具进度流中观察得到，因此不产生额外开销。细节：
+
+- 墙钟时间是该轮的真实时长（超过一分钟显示为 `2m05s`）。
+- 工具调用按动词分组（`edited`、`read`、`ran`、`searched` 等）并正确使用单复数；没有归入动词的插件/MCP 工具会合并为 `called N tools`。
+- `+X -Y` 行数增减只在工具结果本身报告了 diff 时出现（目前是 `patch`）。Hermes 从不调用 git 来计算它们，因此 `write_file` 的编辑只计数、不带增减。
+- **失败的工具调用不计入** —— 被拒绝的写入永远不会显示为成功的编辑（相应的警告见[文件变更验证器](#file-mutation-verifier)）。
+- 长轮次最多四个动词段加一个 `+N more` 尾巴，因此该行永不换行。
+- 没有工具调用的快速轮次完全不打印任何内容。
+
+`display.spinner_token_flow`（默认 `true`）把当前轮累计的输出 token 追加到 CLI spinner 的实时计时器上：
+
+```
+  ⚡ Reading cli.py  (  2.3s · ↓ 1.2k tok)
+```
+
+计数按轮统计（会话总量在轮次开始时作为基线），并随该轮中每次 API 调用报告用量而更新。在首次用量报告到达之前不渲染任何内容，因此你永远不会看到误导性的 `↓ 0 tok`。
+
+两个键都仅用于显示且仅限 CLI：在安静模式、`display.tool_progress` 为 `off` 时、在单查询/`-Q` 批量运行中，以及在 gateway/消息界面上（后者改用 `display.runtime_footer`）都会被抑制。把任一键设为 `false` 即可关闭。
+
+### 文件变更验证器 {#file-mutation-verifier}
 
 当 `display.file_mutation_verifier` 为 `true`（默认）时，每当本轮中 `write_file` 或 `patch` 调用失败且从未被对同一路径的成功写入取代时，Hermes 会在 assistant 的最终响应中附加一行建议。这捕获了"批量并行补丁，一半静默失败，模型总结成功"这类过度声明，而无需您在每次编辑后手动运行 `git status`。
 
@@ -1380,6 +1892,40 @@ display:
 | `verbose` | 完整参数、结果和调试日志 |
 
 在 CLI 中，使用 `/verbose` 循环切换这些模式。要在消息平台（Telegram、Discord、Slack 等）中使用 `/verbose`，请在上方的 `display` 部分设置 `tool_progress_command: true`。该命令将循环切换模式并保存到配置。
+
+### 聚焦视图（`/focus`，CLI + TUI） {#focus-view}
+
+`display.focus_view: true` 启用**聚焦视图** —— 一个精简输出的显示模式，适用于你只想要答案、不想要逐步过程的时候。它是同一套 `tool_progress` 机制上的薄层，而不是第二条抑制路径：
+
+- 打开它会把 `tool_progress` 钉在 `off`，并把之前的模式暂存到 `display.focus_saved_tool_progress`；
+- `/focus off` 精确恢复该模式，因此 `/verbose verbose` 的配置能完整往返；
+- 每个完成的轮次以一行暗色恢复提示结束 —— `⋯ 7 tool lines hidden · /focus off to show` —— 按*聚焦前*的模式计数，因此它绝不会声称隐藏了你本来就已关闭的行；
+- 状态栏中常驻一个 `◉ focus` 徽章（prompt_toolkit CLI 与 Ink TUI 都是），因此精简模式永远不会不可见；
+- 聚焦开启时循环 `/verbose` 会把模式交还 `/verbose` 并清除该徽章。
+
+聚焦视图**仅用于显示**。它绝不修改对话历史、系统提示、工具 schema 或任何请求载荷 —— 被隐藏的细节只在屏幕上被抑制，绝不丢弃，prompt 缓存完全不受影响。
+
+### 状态栏字段选择（CLI/TUI） {#status-bar-field-selection}
+
+CLI/TUI 底部的交互式状态栏显示模型、上下文用量、压缩次数、后台活动计数器、计时器和模式徽章。`display.status_bar.fields` 选择其中哪些可见 —— 适用于极简状态栏（只有模型 + 时长），或显示需要主动开启的会话 token 总量：
+
+```yaml
+display:
+  status_bar:
+    fields: ["model", "duration", "total_tokens"]   # 只控制可见性；内置顺序保持不变
+```
+
+支持的字段：`model`、`context_detail`（已用/总 token）、`context_pct`（百分比 + 进度条）、`cache_hit`（prompt 缓存命中率 —— 切换模型和压缩时重置）、`latency`（滚动平均 API 延迟，最近 10 次调用）、`tps`（滚动输出 token/秒，最近 10 次调用）、`compressions`、`bg_tasks`、`bg_processes`、`bg_subagents`、`goal`、`git_branch`（⎇ 工作目录的当前 git 分支 —— 仅主动开启，默认永不显示；分离 HEAD 显示缩写提交）、`duration`、`prompt_elapsed`、`idle_since`、`focus`、`yolo`、`stash`、`battery`、`title`（右对齐的会话徽章）以及 `total_tokens`（会话 Σ —— 仅主动开启，默认永不显示）。
+
+注意：
+
+- 空列表（默认）保持标准集合 —— 除 `total_tokens` 和 `git_branch` 之外的一切。
+- 配置控制的是**可见性，不是顺序**；字段按其内置位置渲染。
+- 窄终端仍会丢弃仅宽屏字段（`context_detail`、`cache_hit`、`latency`、`tps`、`prompt_elapsed`、`idle_since`），无论配置如何（`cache_hit` 在中档 ≥52 列也会显示）。
+- `latency`/`tps` 在记录到 API 调用之前保持隐藏（例如 Codex app-server 后端不报告延迟）。
+- 这里的 `battery` 与 `title` 可见性会与它们各自的开关（`/battery`、`/title`）叠加 —— 两者都开启时该段才显示。
+- 同一个键也会过滤 **Ink TUI** 的状态行（`hermes tui`），其中 `cache_hit`、`latency` 和 `tps` 在 ≥96/104/110 列的终端上分别渲染为宽度受控的尾段（◎ / ◷ / ↑）。
+- 仅用于显示：不影响 prompt 缓存或请求载荷。更改在下一会话启动时生效。
 
 ### 运行时元数据页脚（仅限 gateway）
 
@@ -1443,6 +1989,10 @@ privacy:
 
 哈希是确定性的 —— 同一用户始终映射到同一哈希，因此模型仍然可以在群聊中区分用户。路由和传递在内部使用原始值。
 
+### OpenAI Codex 请求身份 {#openai-codex-request-identity}
+
+OpenAI 要求第三方 Codex harness 表明自己的身份。经 ChatGPT 认证、发往官方 Codex 端点的请求会自动发送 `originator: hermes-agent` 和 `User-Agent: HermesAgent/<version>`。现有的 ChatGPT 账户头会保留。不会发送额外的提示内容或遥测请求。直接的 OpenAI API 请求和自定义代理端点保持不变。
+
 ## 语音转文字（STT）
 
 ```yaml
@@ -1471,6 +2021,39 @@ STT_OPENAI_MODEL=whisper-1
 GROQ_BASE_URL=https://api.groq.com/openai/v1
 STT_OPENAI_BASE_URL=https://api.openai.com/v1
 ```
+
+### 转写提示（词汇提示） {#transcription-prompt-vocabulary-hints}
+
+`stt.prompt` 是传递给支持提示的 STT 后端的可选静态提示。用于专有名词、产品名，以及 Whisper 家族模型本来会听错的术语：
+
+```yaml
+stt:
+  provider: "local"
+  prompt: "Hermes, Teknium, Nous Research, kanban, Ollama"
+```
+
+**组合方式。** 配置值是基底。注册了 `pre_transcription` 钩子的插件在其上修改，逐字段后写者胜。多个插件的提示以确定性的方式组合：插件发现按插件 id 排序加载插件，每个插件的回调按自己的注册顺序运行，因此同一组插件总是产生相同的最终提示。钩子对 `prompt` 返回空字符串会为该请求清除配置中的提示。钩子也可以覆盖 `language` 和 `model`；`file_path` 只读，任何试图修改它的尝试都会被记录并丢弃。未注册钩子且未设置 `stt.prompt` 时，发出的请求与之前版本完全一致。
+
+**Provider 支持。**
+
+| Provider | 提示参数 | 行为 |
+|----------|-----------------|----------|
+| `local`（faster-whisper） | `initial_prompt` | 原样转发给本地模型 |
+| `openai` | `prompt` | 原样转发到转写请求中 |
+| `groq` | `prompt` | 原样转发到转写请求中 |
+| `mistral` | `prompt` | 原样转发到转写请求中 |
+| `deepinfra` | `prompt` | OpenAI 兼容路径，原样转发 |
+| `xai` | 不支持 | 以 DEBUG 级别记录，请求不带提示继续 |
+| `elevenlabs` | 不支持 | 以 DEBUG 级别记录，请求不带提示继续 |
+| `local_command` | 不支持 | 以 DEBUG 级别记录，请求不带提示继续 |
+| `stt.providers.<name>` 且 `type: command` | 不支持 | 以 DEBUG 级别记录，请求不带提示继续 |
+| 插件注册的 provider | `transcribe(**extra)` kwargs 中的 `prompt` | 仅在设置了提示时发送，因此早于该键的 provider 看到的是不变的调用 |
+
+**长度。** Whisper 家族模型只对最后的约 224 个提示 token 条件化。对于 whisper 家族后端（`local`、`openai`、`groq`、`deepinfra`），Hermes 在客户端强制执行该上限：过长的最终提示会被截断到尾部并记录警告 —— 请求绝不会因提示长度而报错。其他后端（`mistral`、插件 provider）收到未改动的提示，自行负责校验。无论哪种情况，都请保持提示简短具体。
+
+:::warning 提示会随你的音频一起上传
+最终提示会与音频文件一起发送给配置的 STT provider。请把机密和会话派生的上下文排除在 `stt.prompt` 以及 `pre_transcription` 钩子返回的任何内容之外，尤其是当 provider 是托管 API 而非本地 `faster-whisper` 时。
+:::
 
 ## 语音模式（CLI）
 
@@ -1538,6 +2121,23 @@ group_sessions_per_user: true  # true = 群组/频道中每用户隔离，false 
 - 线程与其父频道保持隔离；使用 `true` 时，每个参与者在线程内也获得自己的会话。
 
 有关行为详情和示例，请参阅[会话](./sessions.md)和 [Discord 指南](./messaging/discord.md)。
+
+## 原生托管房间讨论上限 {#native-hosted-room-discussion-limits}
+
+原生服务器托管房间在每个讨论中让所有成员共享这些讨论上限。它们适用于该服务拥有的所有原生托管房间，不适用于由 Desktop 渲染器驱动或镜像的房间。
+
+```yaml
+hosted_rooms:
+  discussion:
+    max_rounds: 3      # 每个讨论的默认最大排程轮数
+    max_messages: 10   # 所有成员合计的默认可见 bot 回复总数
+```
+
+两个键都是可选的；省略时保留向后兼容的默认值 3 轮和 10 条回复。值必须是正整数：不接受 `0`、负值、`null`、布尔值、字符串（包括带引号的数字或 `"unlimited"`）以及浮点数。无效值会被忽略，并在 gateway 日志中给出警告，然后应用默认值，因此一个笔误永远不会让群聊离线。例如，把 `max_rounds: 6` 和 `max_messages: 30` 设成更大但仍受控的讨论预算（这样 5 人房间就能越过 10 条回复的停止点）。
+
+请在持有房间存储的 Hermes home（紧邻 `shared-state.db` 的根 home）的 `config.yaml` 中设置这些键，而不是在单个房间成员的 profile 配置里。它们对 gateway 和 Desktop/TUI 后端所服务的房间同样生效。每个服务进程在启动时读取一次：修改后请重启共享该房间存储的每个进程。
+
+这些是上限，不是目标，也不保证任务完成。讨论可能提前结束，Stop 与审批门仍然有效。
 
 ## 未授权 DM 行为
 
@@ -1780,6 +2380,39 @@ approvals:
 设置 `approvals.mode: off` 会禁用终端命令的所有安全检查。仅在受信任的沙箱环境中使用。
 :::
 
+### 拒绝熔断器 {#denial-circuit-breaker}
+
+`approvals.denial_breaker_threshold`（默认 `3`）防止 agent 反复尝试智能审批审查器一直拒绝的命令变体 —— 每次重试都要再烧一次 guardian LLM 调用。在一个会话中连续被拒这么多次之后，拒绝消息会升级为硬停止指令，告诉 agent 停下、报告被阻止的操作，并请你手动运行它或使用 `/approve`。任何批准都会重置计数；设为 `0` 可禁用：
+
+```yaml
+approvals:
+  denial_breaker_threshold: 3   # 0 禁用熔断器
+```
+
+### 拒绝规则 {#deny-rules}
+
+`approvals.deny` 是一组 glob 模式列表，会无条件阻止匹配的终端命令 —— 即使在 `--yolo`、`/yolo` 或 `mode: off` 下也是如此。它是内置硬线黑名单的用户可编辑对应物：
+
+```yaml
+approvals:
+  deny:
+    - "git push --force*"
+    - "*curl*|*sh*"
+```
+
+模式是不区分大小写的 fnmatch glob，在 YAML 中必须加引号（裸的前导 `*` 会导致解析错误）。详情见[安全 —— 用户自定义拒绝规则](./security.md)。
+
+### 自定义智能审批策略 {#custom-smart-approval-policy}
+
+`approvals.smart_policy` 让你把自己的规则追加到智能审批审查器的指令中。设置后，该文本会加入 guardian LLM 的系统提示（受信通道 —— 绝不与不受信任的命令文本并列），因此你可以针对自己的环境收紧或放宽它的判断，而无需改代码：
+
+```yaml
+approvals:
+  smart_policy: |
+    Always ESCALATE commands that modify anything under /etc.
+    APPROVE docker compose restarts in ~/deploys — they are routine here.
+```
+
 ## 检查点
 
 破坏性文件操作之前的自动文件系统快照。详情请参阅[检查点与回滚](./checkpoints-and-rollback.md)。
@@ -1846,7 +2479,7 @@ Hermes 使用两种不同的上下文范围：
 - **项目上下文文件使用优先级系统** —— 仅加载一种类型（第一个匹配优先）：`.hermes.md` → `AGENTS.md` → `CLAUDE.md` → `.cursorrules`。SOUL.md 始终独立加载。
 - **AGENTS.md** 是分层的：如果子目录也有 AGENTS.md，所有都会合并。
 - 如果 `SOUL.md` 不存在，Hermes 会自动生成默认的 `SOUL.md`。
-- 所有加载的上下文文件上限为 20,000 字符，并进行智能截断。
+- 所有加载的上下文文件上限为 `context_file_max_chars` 个字符（默认 20,000），并进行智能截断。
 
 另请参阅：
 - [个性与 SOUL.md](./features/personality.md)
@@ -1866,6 +2499,32 @@ Hermes 使用两种不同的上下文范围：
 MESSAGING_CWD=/home/myuser/projects    # Gateway 会话
 TERMINAL_CWD=/workspace                # 所有终端会话
 ```
+
+## 网络 {#network}
+
+出站 HTTP 的连通性变通方案：
+
+```yaml
+network:
+  force_ipv4: false   # 强制出站连接使用 IPv4（默认：false）
+```
+
+`force_ipv4` —— 在 IPv6 损坏或不可达的服务器上，Python 会先解析 AAAA 记录，可能在回落到 IPv4 之前挂满整个 TCP 超时。Hermes 已经为它发出的每个出站连接同时竞速 IPv6 与 IPv4（Happy Eyeballs，RFC 8305：IPv4 尝试在 IPv6 之后 250 ms 启动，谁先连上算谁赢），因此一条被通告但实际黑洞的 IPv6 路由每次连接只花约四分之一秒，而不是整个超时。这覆盖 gateway 的 WebSocket 拨号（relay 连接器、平台适配器）以及 HTTP。只有当你希望完全跳过 IPv6 直接走 IPv4 时才把它设为 `true`。`hermes doctor` 会执行 `IPv6 route` 检查，检测死亡的 IPv6 路径并指向该设置。
+
+## 引导 {#onboarding}
+
+首次接触的引导提示与首条消息的邀约：
+
+```yaml
+onboarding:
+  profile_build: "ask"   # "ask"（默认）| "off"
+  seen: {}               # 内部锁存 —— 保持为空
+  run: null              # 桌面端首次运行引导：null（全新安装）| true | false
+```
+
+- `profile_build` —— 控制有史以来第一条消息上的邀约，在 TUI、桌面应用和消息平台私信中生效（群聊中永不出现）。`"ask"`（默认）会主动提出构建用户画像；该邀约是**选择加入且需征得同意的** —— agent 在任何查找之前先询问，绝不静默读取已连接的账户，并把确认的事实保存到用户记忆。`"off"` 只停止该邀约；agent 仍会给出简单的介绍。该邀约每个 profile 最多出现一次。
+- `seen` —— 内部状态。Hermes 在此锁存每个已展示的提示，使其不再触发；首条消息的邀约在展示后也记录在此。不要手工编辑它 —— 如果想重新看到所有提示，请清空整个 `onboarding` 段。
+- `run` —— 桌面应用下次启动时是否打开首次运行引导聊天。未设置表示仅在全新安装时打开（尚无会话和 profile）。引导开始时 Hermes 写入 `true`，完成或跳过时写入 `false`。它始终位于默认 profile 的 `config.yaml` 中，无论应用运行在哪个 profile。设为 `false` 可永不显示；托管安装可以在托管配置中钉住该值。
 
 ## Webapp
 
@@ -1887,3 +2546,45 @@ webapp:
 无论 `host` 是什么，只要 `host` 为 `0.0.0.0` 或 `::`，或设置了 `public_url`，就会启用登录。此时 `hermes webapp` 会打开 Webapp 的地址（设置了 `public_url` 时就是登录返回的地址）供你用仪表盘账户登录：它的一次性链接只会打开无需登录的 Webapp。原生客户端（CLI、TUI 和 Desktop 应用）从不登录：gateway 为它们提供的监听器永远不会要求登录，无论配置如何。
 
 Webapp 设置从为该 profile 提供服务的 gateway 的配置中读取：对于它服务的具名 profile，读取默认 profile 的配置；否则读取独立 profile 自己的配置。
+
+## 仪表盘 {#dashboard}
+
+[Web 仪表盘](./features/web-dashboard.md)的配置 —— 视觉主题、公共 URL 与认证提供商。认证提供商（OAuth、基础密码、drain）在 web-dashboard 页面有详细说明；这里是 `config.yaml` 中的形状。
+
+```yaml
+dashboard:
+  theme: "default"            # "default" | "midnight" | "ember" | "mono" | "cyberpunk" | "rose"
+  show_token_analytics: false # 重新启用（仅本地估算的）token/成本分析界面
+  public_url: ""              # OAuth redirect_uri 的完整公共权威（环境变量：HERMES_DASHBOARD_PUBLIC_URL）
+  trusted_proxies: []         # 允许提供 X-Forwarded-* 头的代理 IP/CIDR
+  oauth:                      # Portal OAuth 门禁（配合 --host 且非 --insecure 时启用）
+    client_id: ""             # agent:{instance_id} —— 由 Portal 提供
+    portal_url: ""            # 留空 → 插件默认值（生产 Portal）
+  basic_auth:                 # 自托管用户名/密码门禁（dashboard_auth/basic 插件）
+    username: ""              # 留空 → 插件不生效
+    password_hash: ""         # scrypt$...（首选 —— 静态存储无明文）
+    password: ""              # 明文回退（加载时在内存中哈希）
+    secret: ""                # token 签名密钥；留空 → 每进程随机
+    session_ttl_seconds: 0    # 0 → 插件默认值（12 小时）
+  drain_auth:                 # Drain 控制服务凭据门禁（dashboard_auth/drain 插件）
+    scope: "drain"            # 已验证主体的能力标签
+    min_secret_chars: 43      # 熵要求（url-safe-b64 字符；43 ≈ 256 位）
+  ws_ping_interval: 20.0      # 非回环 WebSocket 保活 ping 间隔（秒）
+  ws_ping_timeout: 20.0       # 非回环 WebSocket 保活 pong 超时（秒）
+  ws_orphan_reap_grace_s: 20.0 # WS 分离会话被回收前的宽限期（秒）
+  ssh_isolated_idle_grace_s: 900.0 # 经 SSH 的 Desktop 后端在无客户端且无运行中轮次这么久后退出
+  ws_orphan_activity_stale_s: 600.0 # 分离的 RUNNING 轮次被中断前的活动空闲上限（秒）
+  startup_orphan_sweep: true  # 启动时关闭因 gateway 进程死亡而遗留的会话行
+```
+
+- `theme` —— 仪表盘视觉主题。
+- `show_token_analytics` —— 默认关闭。Analytics 页面与 token/成本数字是**本地下界估算**（不含辅助调用、重试、回退和缓存写入），因此可能远低于 provider 账单。只有在你明白它们不是账单时才设为 `true`。
+- `public_url` —— 设置后，它就是构建 OAuth `redirect_uri` 所用的完整权威（scheme + host + 可选路径前缀）。对于部署在不稳定转发 `X-Forwarded-*` 头的反向代理后的环境，请设置它。留空则使用代理头重建。
+- `trusted_proxies` —— 允许提供 `X-Forwarded-Proto` 和 `X-Forwarded-For` 的 IP 地址或有界 CIDR 网段。回环地址始终自动受信。当 TLS 反向代理从另一个容器或主机连接时配置它。优先使用代理的精确 IP；只有当地址是动态的时候才使用小型专用网段。通配符和 `/0` 网段会被拒绝。
+- `oauth` / `basic_auth` / `drain_auth` —— 由随附的 dashboard-auth 插件读取的认证提供商配置。drain 密钥本身**不**在此设置；它通过 `HERMES_DASHBOARD_DRAIN_SECRET` 环境变量提供。完整认证设置见 [Web 仪表盘](./features/web-dashboard.md)。
+- `ws_ping_interval` / `ws_ping_timeout` —— 非回环绑定的 WebSocket 保活调优（回环连接从不 ping）。在高延迟链路（Tailscale、远距离 SSH 隧道）上提高它们，因为 20 秒默认值可能制造虚假的 1006 断连。
+- `ssh_isolated_idle_grace_s`（默认 `900`）—— 经 SSH 访问的、由 Desktop 拥有的 `hermes serve --isolated` 后端会被有意与 SSH 会话分离，因此睡眠中的笔记本不会把它拆掉；以前每次暗唤醒重连都会留下另一个持有 `state.db` 的后端。现在，一旦这段时间内没有客户端 WebSocket 连接且没有 agent 轮次在运行，后端就会自行退役（有轮次在跑时它保持存活；轮次状态不可读时也保持存活）。如果你依赖分离的后端在笔记本睡眠后完成长任务，请调高该值。这类后端还会发送慢速 WebSocket ping（60 秒，超时 10 分钟），以便发现半开隧道。独立于该宽限期，只要 Desktop 在远程主机上的所有权锁指向同一连接的更新派生，后端就会在轮次之间退役，因此重连风暴无法堆叠分离的后端；这覆盖 POSIX 和原生 Windows SSH 主机。
+- `ws_orphan_reap_grace_s` —— WS 分离会话在孤儿回收器收集它之前等待多久。如果客户端重连缓慢，请与保活值一起调高。周期性的会话维护也会为已关闭的 socket 完成清理，并重新武装缺失的孤儿定时器，因此分离的聊天不能仅因为其初始清理或定时器丢失就一直占着所有权租约。重连会取消该定时器；活跃的委托工作和健康的运行中轮次仍受常规孤儿回收检查保护。（`HERMES_TUI_WS_ORPHAN_REAP_GRACE_S` 仍作为内部覆盖保留。）
+- `ws_orphan_activity_stale_s`（默认 `600`）—— 分离的**运行中**轮次的活动时钟（与 `agent.turn_liveness` 看门狗采样的同一时钟：API 等待、流 token、工具心跳）必须空闲多久，孤儿回收器才会中断它。客户端缺席但仍在积极产出结果的轮次会继续分离运行直至完成 —— 合上笔记本、把移动应用切到后台，或桌面端更新都不再取消健康的长轮次；只有真正卡死的轮次会被中断。设为 `0` 可无视活动状态、一到宽限期就中断（旧行为）。
+- `startup_orphan_sweep`（默认 `true`）—— 上面的 WS 孤儿回收定时器是进程内的，因此在它触发之前发生的 gateway 重启（更新、崩溃、systemd）会让会话行永远保持打开 —— 在 `/resume` 和仪表盘中表现为幽灵般的"活跃"工作。每次 gateway 启动时 —— 无论是 stdio TUI（`entry.main`）还是 desktop/dashboard WebSocket sidecar（`handle_ws`）—— 来源为 `tui` / `desktop` / `subagent` / `unknown`（token 记账守卫不得不自行实体化的行）且开始时间**和**最新消息都早于会话 TTL（`HERMES_TUI_SESSION_TTL_S`，默认 6 小时）的行，会以 `end_reason: startup_orphan_reap` 关闭。消息平台会话（Telegram、Discord 等）永不被触碰，活跃的内存中会话（已经恢复的客户端）被排除，被清理的会话仍可恢复。
+
