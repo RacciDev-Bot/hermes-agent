@@ -384,3 +384,50 @@ def test_plain_crash_does_not_get_the_infrastructure_cooldown(board):
     kbd.detect_crashed_workers(conn)
 
     assert kbd.check_respawn_guard(conn, task.id) is None
+
+
+# --------------------------------------------------------------------------- the budget knob
+
+
+def _crash(board, conn, task, *, failure_limit=None):
+    """Leave one more dead-worker crash on the card, then account it in its own tick."""
+    pid = _dead_worker_pid()
+    _park_as_dead_worker(conn, task, pid)
+    _register_exit(pid, 1)
+    return kbd.detect_crashed_workers(conn, failure_limit=failure_limit)
+
+
+def test_configured_failure_limit_reaches_crash_accounting(board):
+    """``kanban.failure_limit`` is the CRASH budget too (#140426).
+
+    ``detect_crashed_workers`` used to call ``_record_task_failure(failure_limit=None)``, which
+    falls back to the hardcoded ``DEFAULT_FAILURE_LIMIT`` — so an operator who raised the knob
+    saw ``limit_source: dispatcher`` while crashes still tripped at 2. With 5 configured, two
+    identical deaths (in separate ticks, so the >= 3 systemic rule never fires) leave the card
+    retryable at ``consecutive_failures == 2``; the same two deaths under the default still give
+    up."""
+    conn = _connect(board)
+    task = _claimed(board, title="raised budget")
+    for expected in (1, 2):
+        assert _crash(board, conn, task, failure_limit=5) == [task.id]
+        row = dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (task.id,)).fetchone())
+        assert row["consecutive_failures"] == expected
+        assert row["status"] == "ready"
+        task = kb.claim_task(conn, task.id)
+        assert task is not None
+    kinds = [r["kind"] for r in conn.execute(
+        "SELECT kind FROM task_events WHERE task_id = ?", (task.id,))]
+    assert "gave_up" not in kinds
+
+    # Control: the same shape of death under the dispatcher default trips at 2.
+    other = _claimed(board, title="default budget")
+    _crash(board, conn, other)
+    assert dict(conn.execute("SELECT consecutive_failures, status FROM tasks WHERE id = ?",
+                            (other.id,)).fetchone())["consecutive_failures"] == 1
+    other = kb.claim_task(conn, other.id)
+    assert other is not None
+    _crash(board, conn, other)
+    row = dict(conn.execute("SELECT consecutive_failures, status FROM tasks WHERE id = ?",
+                            (other.id,)).fetchone())
+    assert row["consecutive_failures"] == 2
+    assert row["status"] == "blocked"
