@@ -292,7 +292,7 @@ def test_restore_makes_real_probe_reload_in_same_process(tmp_path, monkeypatch):
     from tools.skills_sync_bundled_ops import bundled_skill_for_install, ensure_bundled_skill
     home = tmp_path / 'home'
     monkeypatch.setenv('HERMES_HOME', str(home))
-    p1, l1, m1 = build_preloaded_skills_prompt(['sdlc-review'])
+    _p1, l1, m1 = build_preloaded_skills_prompt(['sdlc-review'])
     assert m1 == ['sdlc-review'] and not l1
     assert bundled_skill_for_install('sdlc-review') == 'sdlc-review'
     assert ensure_bundled_skill('sdlc-review')['ok']
