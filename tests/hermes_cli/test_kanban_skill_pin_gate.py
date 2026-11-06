@@ -231,7 +231,10 @@ async def test_submitter_unknown_receipt_quotes_the_booked_skill_reason(monkeypa
 @pytest.mark.asyncio
 async def test_submitter_without_booked_reason_still_says_retained(monkeypatch):
     monkeypatch.setattr("gateway.session_kanban.worker_result", lambda db, params: {})
-    with pytest.raises(GatewayClientError, match="execution unknown"):
+    # Stacked with #146324: an unsettled receipt with no booked result is the HOST's verdict, so
+    # the submitter raises the infrastructure class (exit 74, no retry budget spent) instead of the
+    # plain transport error — the message still says "execution unknown" and never "refused".
+    with pytest.raises(wc.OwnerUnavailableError, match="execution unknown"):
         wc._exit_code({"status": "unknown", "admission_id": "a1"},
                       {"board": "b", "task_id": "t", "run_id": 1, "claim_lock": "l"}, "/unused/kanban.db")
 

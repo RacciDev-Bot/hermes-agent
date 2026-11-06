@@ -11,6 +11,7 @@ import asyncio
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import sqlite3
 import sys
 import time
 from typing import Optional
@@ -56,6 +57,13 @@ class _Claim:
         return time.monotonic() - self.answered
 
 
+class OwnerUnavailableError(Exception):
+    """The HOST failed this attempt, not the card: the owner stayed silent past ``OWNER_WAIT_S``,
+    or its receipt settled ``unknown`` and the board holds no result for this claim to reconcile.
+    The submitter exits ``KANBAN_INFRASTRUCTURE_EXIT_CODE`` so the dispatcher books the death
+    through the infrastructure seam of #114720 instead of spending the card's retry budget."""
+
+
 async def run(params, board_db):
     from agent.retry_utils import jittered_backoff
     from hermes_cli.gateway_client import connect_gateway, GatewayClientError, outside_restart_wait
@@ -94,7 +102,12 @@ async def run(params, board_db):
                 status = getattr(getattr(exc, 'response', None), 'status_code', None)
                 detail = exc if isinstance(exc, GatewayClientError) else type(exc).__name__ + (
                     f' (HTTP {status})' if status else '')
-                raise GatewayClientError(f'Kanban owner silent for {claim.silent_for():.0f}s: {detail}') from exc
+                # Whether the owner ever answered ``kanban.run`` IS the admission record (the
+                # marker and that answer commit in one board write), so no new flag is needed to
+                # name the never-admitted case.
+                admitted = '' if claim.session_id is None else ' after admission'
+                raise OwnerUnavailableError(
+                    f'Kanban owner silent for {claim.silent_for():.0f}s{admitted}: {detail}') from exc
         else:
             return _exit_code(receipt, params, board_db)
         failures = 1 if claim.answered != seen else failures + 1
@@ -144,20 +157,40 @@ async def _await_receipt(client, params, board_db, claim):
     return receipt
 
 
+def _usable_exit_code(result):
+    """*result*'s exit code when it is a real one, else None (missing, foreign or malformed)."""
+    code = result.get('exit_code') if isinstance(result, dict) else None
+    return code if isinstance(code, int) and not isinstance(code, bool) else None
+
+
 def _exit_code(receipt, params, board_db):
-    from hermes_cli.gateway_client import GatewayClientError
+    from gateway.session_kanban import worker_result, worker_result_for_claim
     if receipt['status'] == 'unknown':
-        # The receipt never settled, but the owner may have booked a result beside the attempt.
-        # Quote it when it names a dead skill pin instead of the bare "execution unknown" that
-        # the caller used to wrap — misleadingly — as an owner refusal.
-        from gateway.session_kanban import worker_result
-        booked = worker_result(board_db, params)
-        booked_output = str(booked.get('last_output') or '').strip()
+        # The owner lost the settlement, not necessarily the work: this run's own
+        # ``worker_result`` — gated by the claim lock AND the interpreter its ``worker_bound``
+        # recorded, the same invariant that let it be written — is the real outcome, so report
+        # it instead of failing the card. Missing, foreign or malformed leaves the host verdict
+        # below standing, so an ambiguous receipt never synthesizes success.
+        try:
+            result = worker_result_for_claim(board_db, params)
+            code = _usable_exit_code(result)
+            booked = worker_result(board_db, params) if code is None else {}
+        except sqlite3.Error:
+            # A board that cannot be read reconciles nothing; the host verdict below stands.
+            result, code, booked = None, None, {}
+        if code is not None and isinstance(result, dict):
+            if result.get('last_output'):
+                print(result['last_output'])
+            return code
+        # The owner may still have booked a result beside the attempt. Quote it when it names a
+        # dead skill pin instead of the bare "execution unknown" that the caller used to wrap —
+        # misleadingly — as an owner refusal.
+        booked_output = str(booked.get('last_output') or '').strip() if isinstance(booked, dict) else ''
         if 'skill not found:' in booked_output:
             print(booked_output, file=sys.stderr)
-            return booked.get('exit_code', 1)
-        raise GatewayClientError('Kanban execution unknown; retained by owner')
-    from gateway.session_kanban import worker_result
+            booked_code = _usable_exit_code(booked)
+            return 1 if booked_code is None else booked_code
+        raise OwnerUnavailableError('Kanban execution unknown; retained by owner')
     result = worker_result(board_db, params)
     # The attempt's reply ends the log, as a one-shot worker's did: crash diagnostics quote it.
     if result.get('last_output'):
@@ -195,6 +228,13 @@ def _submit():
         for key in ('HERMES_SESSION_SOURCE', 'HERMES_TENANT', 'TERMINAL_CWD'):
             os.environ.pop(key, None)
         return asyncio.run(run(params, board_db))
+    except OwnerUnavailableError as exc:
+        # The host's verdict, not the card's: exit 74 books through the dispatcher's
+        # infrastructure seam (#114720), so the death costs no ``consecutive_failures`` and
+        # never trips the breaker. The trailer still records the code for the dead-worker sweep.
+        from hermes_cli.kanban_db import KANBAN_INFRASTRUCTURE_EXIT_CODE
+        print(f'Kanban host unavailable: {exc}', file=sys.stderr)
+        return KANBAN_INFRASTRUCTURE_EXIT_CODE
     except GatewayRPCError as exc:
         # The owner refused admission. ``detail`` names the check that fired (the wire
         # contract of ``session_controls._refusal_data``). Only a skill-pin refusal is
